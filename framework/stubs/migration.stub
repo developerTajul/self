@@ -1,0 +1,26 @@
+<?php
+declare(strict_types=1);
+
+namespace {{ namespace }};
+
+use Framework\Database\Migration;
+use Framework\Database\Schema\Blueprint;
+use Framework\Database\Schema\Schema;
+
+final class {{ class }} extends Migration
+{
+    public function up(): void
+    {
+        // No table was named for this migration, so nothing is scaffolded here —
+        // guessing a table from the description is how a migration ends up
+        // quietly modifying something the author never meant to touch.
+        //
+        // Reach for `Schema::create()` for a new table, or `Schema::table()` for
+        // an existing one, and delete this comment.
+    }
+
+    public function down(): void
+    {
+        //
+    }
+}

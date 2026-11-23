@@ -1,0 +1,15 @@
+# 07 TESTING (ON-DEMAND; CURRENTLY PAUSED)
+Load ONLY when the developer explicitly asks for tests or re-enables testing. STATUS: PAUSED (AGENTS.md section 6).
+While paused: never write/scaffold/require tests, never create `tests/`, never claim tests in a checklist. An explicit "write a test for X" overrides the pause for that request only.
+TO RE-ENABLE (developer only): remove the TESTS PAUSED rule from AGENTS.md section 6, set STATUS to ACTIVE here, restore the test tick-box in each Definition of Done that carries "(Tests paused)".
+
+## RULES WHEN ACTIVE
+1 Every Service use case has a unit test with MOCKED contracts (no DB/storage); assert on the returned `Result` (success/failure, data, errorCode). 2 Entity behaviour is tested directly (pure, no mocks): happy path, each domain exception, the NEW instance, its Domain Event, original unchanged. 3 Repositories/adapters get a SEPARATE integration test on a real test DB (the only place allowed to touch `$wpdb` in tests). 4 Layout: `tests/Unit/<Module>/...` (pure), `tests/Feature/<Module>/...` (integration), mirroring `core/<Module>`.
+- Command Service: success; each domain error key; rollback on failure; events only AFTER commit and none on rollback; side-effect failures (file cleanup, dispatch) are logged and do NOT fail a committed write; an unexpected Throwable returns the generic key without the raw message. The `TransactionManagerContract` double MUST run the callback (`run(callable $callback): mixed => $callback()`); a mock returning null makes every assertion vacuous.
+- Query Service: ResponseDTO content; not-found; generic failure; assert no write call, no event dispatcher, no transaction manager (the double is the READ port).
+- Pure tests needing `TranslatorContract` use an in-memory `ArrayTranslator`, never the framework container.
+- Mappers/DTOs: Request Mapper plain array -> DTO (uploaded file stays `mixed`, optional defaults); each `with*()` returns a NEW instance; Response Mapper Entity -> DTO.
+- Delivery (feature): FormRequest rules pass/fail; Controller with a faked Service: success redirect with message, failed Result back with error + old input.
+- UPDATE tests stub `findByIdForUpdate` (a test stubbing only `findById` passes silently against a non-locking implementation) and assert `rollback()` on every failure branch, new upload removed on failure, old file removed only after commit. DELETE: not found -> `{MODULE}_NOT_FOUND`, `delete()` never called; repository false -> `{MODULE}_DELETE_FAILED`; file deleted only after commit. INDEX: ResponseDTOs keep total/currentPage/perPage/lastPage; `per_page` clamped to 1-100.
+- Portability: Core unit tests use only mocked Contracts, so they pass untouched under any framework.
+DoD when active: [ ] Entity behaviour tested. [ ] Services tested with mocked contracts. [ ] Events asserted after commit. [ ] Repositories integration-tested. [ ] Tests mirror `core/<Module>`.

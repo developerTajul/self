@@ -1,0 +1,149 @@
+# 05 RICH DOMAIN MODEL AND SERVICES (CQS)
+Binding. Extends 01 and AGENTS.md s7-s10. Load when writing or changing an Entity, Value Object, Command/Query Service or ResponseDTO. Example: Coupon. Applies to NEW modules and modules the prompt asks to migrate; older modules (Category, Brand) keep their shape unless asked.
+
+## R1 THE ENTITY IS THE SINGLE SOURCE OF TRUTH
+1 Rules, invariants, transitions and derived business values are Entity/Value Object methods, never in a Service, Controller, Repository or Mapper. 2 `readonly class`, never `final`; a behaviour method enforces its rule and returns a NEW Entity; nothing outside the Entity assigns its properties (full encapsulation with private ctor + `create()`/`reconstitute()` is per-module, not mandated; no caller mutating state IS). 3 Create through a named constructor (`Coupon::create()`), never an invalid state; the Infrastructure EntityMapper rebuilds from storage via the public ctor or `reconstitute()`. 4 Events: carried in a readonly list with `releaseEvents()`; never dispatched by the Entity; every behaviour method forwards existing events; released BEFORE persisting, dispatched after commit (08). An event-less Entity has NO list and NO `releaseEvents()` (both are added with the first event-raising method). 5 The Entity asks the outside world for nothing: time, ids, random values are PASSED IN (`DateTimeImmutable $now`); no framework import, facade, helper or I/O. 6 Violations raise `<Module><Reason>Exception`; the Service catches it and returns `Result::failure` with a domain key. 7 A ctor-and-public-fields Entity is anemic: a defect once the module has any rule; do not invent rules, never leave a real one in a Service.
+`$id` is ALWAYS `?int` (null until persisted); the ResponseDTO keeps `int $id` (mapper casts `(int) $entity->id`).
+
+## R2 ENTITY TEMPLATE
+```php
+readonly class CouponEntity
+{
+    /** @param list<object> $domainEvents events raised by this instance */
+    public function __construct(
+        public ?int $id, public string $code, public int $usageLimit, public int $usedCount,
+        public ?DateTimeImmutable $expiresAt, private array $domainEvents = [],
+    ) {}
+
+    public static function create(string $code, int $usageLimit, ?DateTimeImmutable $expiresAt): self
+    {
+        // TODO: guard invariants (blank code, usageLimit < 1 ...)
+        return new self(id: null, code: $code, usageLimit: $usageLimit, usedCount: 0, expiresAt: $expiresAt);
+    }
+
+    public function isExpired(DateTimeImmutable $now): bool { return $this->expiresAt !== null && $this->expiresAt <= $now; }
+
+    /** Redeems the coupon once. Returns a new instance. @throws CouponExpiredException @throws CouponUsageLimitReachedException */
+    public function redeem(DateTimeImmutable $now): self
+    {
+        if ($this->isExpired($now)) { throw new CouponExpiredException($this->code); }
+        if ($this->usedCount >= $this->usageLimit) { throw new CouponUsageLimitReachedException($this->code); }
+
+        return new self(id: $this->id, code: $this->code, usageLimit: $this->usageLimit, usedCount: $this->usedCount + 1,
+            expiresAt: $this->expiresAt, domainEvents: [...$this->domainEvents, new CouponRedeemedEvent(code: $this->code)]);
+    }
+
+    /** @return list<object> */
+    public function releaseEvents(): array { return $this->domainEvents; }
+}
+readonly class CouponRedeemedEvent { public function __construct(public string $code) {} } // plain PHP, no framework base
+```
+VALUE OBJECTS (Money, Email, DateRange, Percentage): own rule, no identity; `readonly`, validate in the ctor/named ctor, compare by value; in the module's Domain (Shared/Domain only if it passes the admission rule, 01 P4).
+
+## R4 SERVICE RULES
+One class = Command OR Query. No business rule in a Service. Every public method returns `Result` carrying a ResponseDTO/list, never an Entity/row/paginator/framework type. Domain exceptions are caught in the Service and become `Result::failure` with a domain key. Depend only on Contracts, DTOs, Shared blocks; ctor promotion only. Each Service `implements` its inbound contract (`<Module>CommandServiceContract`/`<Module>QueryServiceContract`, bound in the module provider; docblock `@implements ...`); delivery injects the contract. Narrower read ports (`<Module>FormOptionsContract`) are additive.
+
+## R5 COMMAND SERVICE (WRITE; DRY TRANSACTION WRAPPER)
+Inside the transaction: 1 load (existing: `findByIdForUpdate()`, never plain `findById()`) or create via named constructor; apply derived fields via the DTO's `with*()` clones. 2 call the Entity behaviour method (it THROWS a domain exception on violation). 3 `$events = $entity->releaseEvents()`, THEN `create/update(entity)` (the returned Entity has no events). 4 build the ResponseDTO. Outside: the `executeInTransaction()` catch converts each domain exception to `Result::failure` (rollback already happened) and cleans up (delete a new upload); NEVER swallow a Throwable after a write and return a failure (it COMMITS partial work); pre-write guards (`=== null`) MAY return `Result::failure` inside the closure. After commit: dispatch `$events`, push jobs, delete replaced files; a dispatch failure after commit is logged, the success Result stays, no rollback.
+```php
+final class CouponCommandService implements CouponCommandServiceContract
+{
+    private const ERROR_NOT_FOUND = 'COUPON_NOT_FOUND';
+    private const ERROR_UPDATE_FAILED = 'COUPON_UPDATE_FAILED';
+
+    public function __construct(
+        private readonly CouponRepositoryContract $couponRepository, private readonly CouponResponseMapper $responseMapper,
+        private readonly TransactionManagerContract $transactionManager, private readonly EventDispatcherContract $eventDispatcher,
+        private readonly TranslatorContract $translator, private readonly ClockContract $clock, private readonly LoggerInterface $logger,
+    ) {}
+
+    /** Redeems a coupon once. */
+    public function redeemCoupon(int $couponId): Result
+    {
+        $events = [];
+        $result = $this->executeInTransaction(
+            operation: function () use ($couponId, &$events): Result {
+                $coupon = $this->couponRepository->findByIdForUpdate($couponId);
+                if ($coupon === null) {
+                    return Result::failure(message: $this->translator->translate('coupon.not_found'), errorCode: self::ERROR_NOT_FOUND);
+                }
+                $redeemedCoupon = $coupon->redeem($this->clock->now());
+                $events = $redeemedCoupon->releaseEvents(); // BEFORE persisting
+                $savedCoupon = $this->couponRepository->update($redeemedCoupon);
+                return Result::success(data: $this->responseMapper->toResponseDTO($savedCoupon), message: $this->translator->translate('coupon.redeemed'));
+            },
+            logMessage: 'Coupon redemption failed.', fallbackMessageKey: 'coupon.update_failed',
+            fallbackErrorCode: self::ERROR_UPDATE_FAILED, context: ['coupon_id' => $couponId],
+        );
+        if (! $result->isFailure()) { $this->dispatchEvents($events); }
+        return $result;
+    }
+
+    private function executeInTransaction(callable $operation, string $logMessage, string $fallbackMessageKey, string $fallbackErrorCode, array $context = []): Result
+    {
+        try {
+            return $this->transactionManager->run($operation);
+        } catch (CouponExpiredException $exception) {
+            return Result::failure($exception->getMessage(), 'COUPON_EXPIRED');
+        } catch (\Throwable $exception) {
+            $this->logger->error(message: $logMessage, context: array_merge($context, ['message' => $exception->getMessage()]));
+            return Result::failure(message: $this->translator->translate($fallbackMessageKey), errorCode: $fallbackErrorCode);
+        }
+    }
+
+    /** @param list<object> $events */
+    private function dispatchEvents(array $events): void
+    {
+        try { foreach ($events as $event) { $this->eventDispatcher->dispatch($event); } }
+        catch (\Throwable $exception) { $this->logger->error('Coupon events failed after commit', ['error' => $exception->getMessage()]); }
+    }
+}
+```
+
+## R6 QUERY SERVICE (READ)
+No transaction, events, queue or write call. Depends on the READ port `<Module>QueryContract`, never the write port; read-optimised methods (filters, pagination, projections); a full Entity is not required when a read model suffices (still Domain/read-model types, never rows). Returns `Result` with a ResponseDTO/list/paginated ResponseDTOs. Ctor takes only: read port, response mapper, logger (NO transaction manager, event dispatcher, queue manager, slug generator, file uploader).
+```php
+final class CouponQueryService implements CouponQueryServiceContract
+{
+    public function __construct(private readonly CouponQueryContract $couponQuery, private readonly CouponResponseMapper $responseMapper) {}
+    /** Finds one coupon for display. */
+    public function findCoupon(int $couponId): Result
+    {
+        $coupon = $this->couponQuery->findById($couponId); // pure read: on the READ port, not CouponRepositoryContract
+        if ($coupon === null) { return Result::failure('Coupon not found.', 'COUPON_NOT_FOUND'); }
+        return Result::success($this->responseMapper->toResponseDTO($coupon));
+    }
+}
+```
+
+## R7 RESPONSE DTO
+`readonly class <Module>ResponseDTO`, promoted plain types only (scalars, arrays, nested ResponseDTOs, `DateTimeImmutable`); built only by `<Module>ResponseMapper` (presentation concerns like formatted values and resolved URLs go there); the SAME DTO serves API, Web, Console, WordPress; channel formatting is the delivery adapter's job; delivery stays thin (validate -> Request Mapper -> ONE Service method -> translate Result with a guard clause).
+
+## R8 PORT SHAPE (ENTITY-BASED, SPLIT BY INTENT)
+```php
+interface CouponRepositoryContract // Domain/Contracts, WRITE
+{
+    public function findByIdForUpdate(int $couponId): ?CouponEntity; // locking read only
+    public function create(CouponEntity $coupon): CouponEntity;
+    public function update(CouponEntity $coupon): CouponEntity;
+}
+interface CouponQueryContract // Application/Contracts, READ
+{
+    public function findById(int $couponId): ?CouponEntity;
+    public function getFilteredCoupons(CouponFilter $filter): PaginatedResult; // projections (R12.3)
+}
+```
+Two ports, two adapters in `Infrastructure/Repositories/` (`Wp<Module>WriteRepository extends BaseWriteRepository`, `Wp<Module>ReadRepository extends BaseReadRepository`); never reads and writes on one contract. A write port declares no pure read except `findByIdForUpdate()` (standard row-lock name, via `BaseWriteRepository::findRecordForUpdate()`). Write methods and single-record loads take/return ENTITIES (no arrays/DataObjects). The read port lives in `Application/Contracts/` (read models are Application types); the write port in `Domain/Contracts/`. The Infrastructure repository converts via `<Module>EntityMapper` (`toEntity(array)`, `toPersistenceArray(Entity)`); a read adapter returning read models needs no EntityMapper.
+
+## R9 ANTI-PATTERNS (each fails review)
+A Service reading Entity fields to decide; an anemic Entity; setters or in-place mutation; an Entity calling `now()`/facades/helpers; one Service with `createCoupon()` and `listCoupons()`; a Query Service opening a transaction, dispatching or saving; a Service returning an Entity/row/paginator; dispatching before commit; an Entity dispatching; a Repository receiving a DTO/raw array; one contract holding reads and writes, or one adapter implementing both ports; a pure read on a write port; a read adapter extending a write base or able to write; a business rule duplicated in a Controller/FormRequest/Repository; a hardcoded `per_page` bound; a list method hydrating full Entities to show a table; the Domain contract receiving/returning an Application DTO; check-then-insert as the only uniqueness guard; hardcoded user-facing text or `__()`/`trans()` in Core; duplicated try/catch/rollback blocks instead of ONE `executeInTransaction()`; manual `beginTransaction()/commit()/rollback()` in a Service.
+
+## R11 DEFINITION OF DONE (tests paused)
+[ ] Every rule is an Entity/VO method; Entity `readonly class`, not `final`, returns new instances, no framework use. [ ] Event-raising Entity carries events + `releaseEvents()`; an event-less one has neither. [ ] Service is Command OR Query with no business rule, implements its inbound contract. [ ] Command writes via `executeInTransaction()`, events/jobs after commit, no manual transaction. [ ] Query Service has no write/event/queue/transaction and uses the read port. [ ] Repository takes/returns Entities; persistence split correct. [ ] Every method returns `Result` with a ResponseDTO. [ ] List input is a `<Module>FilterDTO` clamped with `<Module>Rules`; reads return projections with labels resolved in the query. [ ] Uniqueness = UNIQUE index + mapped exception, no vendor exception in a Service. [ ] No hardcoded text in Core; Enums expose `translationKey()`, not `label()`.
+
+## R12 READ-SIDE AND PLATFORM PATTERNS
+R12.1 FILTER: `<Module>FilterDTO` (`Application/DTOs/Requests/`, readonly, `perPage` + filter fields, no static factories) is built ONLY by the Request Mapper (`mapToFilterDTO(array $validatedData)`); the Query Service converts it to the immutable VO `<Module>Filter` (`Domain/ValueObjects/`); the READ port receives the Filter, never the DTO.
+R12.2 BOUNDS: `final class <Module>Rules` (`Domain/Rules/`, no framework): `DEFAULT_PER_PAGE`, `MIN_PER_PAGE`, `MAX_PER_PAGE`, pure `clampPerPage(int): int`. The Request Mapper clamps while building the FilterDTO so every channel gets the same bounds; Controllers/Services hold no bound numbers. Zero/negative/non-numeric -> default; above max -> max (DoS protection).
+R12.3 PROJECTION: `<Module>ProjectionDTO` (readonly, plain types, `Domain/ReadModels/`) returned by the READ port, built by the read adapter without hydrating Entities via `EntityMapper::toProjection($row)`; list/search/paginate methods return a `PaginatedResult` of projections; `ResponseMapper::toResponseDTOFromProjection()` maps to ResponseDTO. Entities remain for write use cases and single-record loads that need behaviour.
+R12.4 UNIQUENESS: UNIQUE index + `WpQueryExceptionTranslator` -> `DuplicateKeyException` (or the module's conflict exception); the Service catches THAT.
+R12.5 LOCALIZATION: no hardcoded user-facing text in Core, including Result messages; Core gets text ONLY via `TranslatorContract` (`Core\Shared\Domain\Contracts`; use the method name the existing contract declares, `translate()` or `get()`: verify). Laravel adapter wraps `trans()`; in this repo `WpTranslator` reads key-based `lang/<locale>/<module>.php` (02 s8). A Service producing messages receives `TranslatorContract` by constructor (not baseline). Core never calls `__()`, `trans()`, `lang()`; `errorCode` values are not translated. Domain Enums expose `translationKey(): string` (`'lead.status.pending'`), never `label()` with English.

@@ -1,0 +1,47 @@
+# 01 UNIVERSAL PHILOSOPHY (framework-agnostic; Laravel project and this plugin)
+Binding. A project-specific rule file wins on conflict. Service/transaction/port detail lives in AGENTS.md; this file holds principles.
+
+## P1 GOLDEN RULES
+1. CORE IS FRAMEWORK-FREE: Domain + Application import no framework, ORM, UI or globals.
+2. DEPEND ON INTERFACES: use cases depend on ports; adapters are chosen once at the composition root.
+3. USE CASES RETURN `Result`; never throw for control flow. Exceptions are for exceptional violations, converted to a failure Result.
+4. STRICT TYPING: explicit types on every parameter, property, return.
+5. SCAFFOLD ONLY unless told otherwise: a new module = directory tree, empty skeletons, `// TODO:` comments, no business logic (mandated baseline in 03 excepted).
+6. ANTI-HALLUCINATION: never guess the existence or state of files, archives or modules. Act as a mechanical compiler driven only by the prompt and the developer's schema. A file required by the scaffolding mandate that is missing from the tree: create it, no warning, no speculation.
+7. EXACT-COMMAND EXECUTION: do exactly what was asked across the named layers; no peripheral diagnostics or unrequested extractions.
+8. TERMINAL BELL: when a task's terminal work ends, play the OS bell ONCE as its own separate command (`echo -e "\a"` or `[System.Console]::Beep(1000, 500)`), never chained with `;` or `&&` (09 A7).
+9. RICH DOMAIN MODEL: rules, invariants, transitions live in Entities/Value Objects. Anemic entities are a defect.
+10. SERVICES ORCHESTRATE, SPLIT BY INTENT (CQS): Command and Query Services are separate classes; every method returns a `Result` carrying a ResponseDTO.
+11. PORTABLE CORE: persistence, events, queues, transactions, all I/O reach Core only through ports. Moving `core/` needs only new adapters + a new composition root, never an edit in Domain/Application.
+
+## P2 HEXAGONAL MODEL
+```
+Delivery (HTTP/CLI/WP handlers)        <- framework-aware (DTO in -> Result out)
+Application (use cases/services)       <- framework-free (depends on Contracts)
+Domain (entities, events, ports)       <- zero dependencies
+Infrastructure (DB, storage, adapters) <- framework-aware (implements ports)
+```
+Direction: Infrastructure -> Application -> Domain. Litmus test: swapping the framework changes only Delivery and Infrastructure. A WordPress plugin is another framework with its own Delivery (admin handlers, REST, WP-CLI) and Infrastructure (`Wp...` adapters).
+
+## P3 LAYER RESPONSIBILITIES
+- DOMAIN: immutable Entities with the rules, domain events, ports, VOs/data objects, domain exceptions, enums. No framework/IO, no persistence/HTTP knowledge.
+- APPLICATION: Command/Query Services, request/response DTOs, entity->DTO mappers. No ORM/DB/HTTP objects, no UI concerns, no business rules.
+- INFRASTRUCTURE: port implementations (repositories, storage, transactions, hashing, event/queue dispatch). Framework types never leak upward through parameters/returns.
+- DELIVERY: validate -> build DTO -> call ONE use case -> translate Result. No business rules, no direct repository calls.
+
+## P4 CROSS-CUTTING
+- DECOUPLING: Domain imports only Domain + built-ins; Application is framework-free and receives built DTOs; ALL I/O (DB, storage, transactions, hashing, auth, uniqueness, events, queues, clock) sits behind a port; persistence models never cross the boundary (repositories map to Entities); Delivery owns no rules; one composition root per environment.
+- IMMUTABILITY: Entities, DTOs, data objects are immutable; change = a NEW instance (`with*()`); an Entity action (`cancel()`) enforces invariants and returns a NEW Entity.
+- RICH DOMAIN: create via named constructor (never an invalid state); Entity carries plain Domain Events (08); repositories take/return Entities.
+- PORTABILITY: events/jobs reach the framework only via `EventDispatcherContract` / `QueueManagerContract`. Core never calls `event()`, `dispatch()`, `Queue::push()`, `do_action()`.
+- NAMING: interfaces end `...Contract`; one type per file, filename == type; types PascalCase, methods/properties camelCase, constants UPPER_SNAKE_CASE. Exception: a ResponseDTO property serialized straight to a client keeps the wire casing (AGENTS P16).
+- SEMANTIC NAMES (STRICT): no abbreviations (`$couponCreateDTO`, not `$dto`; `$transactionManager`, not `$tx`).
+- SHARED KERNEL ADMISSION: stable, generic, technical capabilities only (transactions, storage, pagination, Result, base repository). Never business concepts. Test: "would this make sense in a completely different app?" No -> it belongs in a module. Shared Domain is imported by everything: guard it hardest.
+
+## P5 DESIGN PRINCIPLES
+- SOLID: one reason to change per class (Mapper maps, Repository persists, Service orchestrates ONE use case); extend by adding an adapter/module, not by editing a stable base; an adapter is a drop-in for its port (no surprise exceptions, no narrower behaviour); ports are small and use-case-shaped (no 20-method repository interface); use cases depend on ports, concretions are injected and bound once (never `new` an adapter in a Service).
+- KISS/YAGNI: simplest thing that satisfies the boundaries; no speculative abstractions. YAGNI covers business invariants and feature use cases ONLY, never the mechanical baseline (ports, adapters, mappings, response envelopes) mandated in 03: skipping it is a defect.
+- TELL, DON'T ASK: behaviour lives in the Entity (`$coupon->isExpired()`, `$order->canBeCancelled()`); a Service tells it instead of reading fields and deciding. Even simple CRUD Entities enforce basic invariants (name not blank, allowed status transitions). Do not invent rules the business lacks; do not leave real ones in the Service. In doubt, put the rule IN THE ENTITY. Delivery's `isFailure()` handling is a translation boundary and is allowed.
+
+## P6 DEFINITION OF DONE (ANY MODULE)
+[ ] strict types; namespace matches path. [ ] Domain has zero framework imports; Application imports only ports/DTOs/Shared. [ ] All I/O behind a port. [ ] Use cases return `Result`; no exception leaks upward. [ ] Model/row <-> Entity through a mapper. [ ] Each port bound once. [ ] Delivery thin. [ ] Entities/DTOs immutable. [ ] Rules in the Entity. [ ] Service is Command OR Query; returns ResponseDTO, never Entity/row. [ ] Events/jobs plain PHP, via ports, after commit. [ ] Nothing in Core changes to run on another framework.

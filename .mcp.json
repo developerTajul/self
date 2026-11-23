@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "wp-architecture-helper": {
+      "command": "php",
+      "args": [
+        "H:/laragon/www/leadbridge-crm/wp-content/plugins/wp-mini-laravel/tools/mcp-server/server.php"
+      ],
+      "env": {
+        "PROJECT_ROOT": "H:/laragon/www/leadbridge-crm/wp-content/plugins/wp-mini-laravel"
+      }
+    }
+  }
+}

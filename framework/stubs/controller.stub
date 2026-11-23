@@ -1,0 +1,10 @@
+<?php
+declare(strict_types=1);
+
+namespace {{ namespace }};
+
+use Framework\Routing\Controller;
+
+class {{ class }} extends Controller
+{
+}

@@ -1,0 +1,28 @@
+# 08 EVENTS AND QUEUES
+Load when an Entity raises a Domain Event, a Command Service dispatches events/pushes a job, or a listener, queue handler or event/queue adapter is written or reviewed. Optional per module: create events/jobs only when a use case needs them.
+
+## E1 Event vs Job
+Event = past-tense fact raised by an Entity, 0..n listeners (`CouponRedeemedEvent`). Job = deferred command, exactly 1 handler (`CouponExpireJob`). A listener MAY push a job for slow/retry work. Both are plain PHP and reach the framework ONLY via `EventDispatcherContract` / `QueueManagerContract`.
+
+## E2 Event object
+`readonly class`, no framework base/import, name `<Module><PastAction>Event` in `core/<Module>/Domain/Events/`, plain data only (scalars, VOs, `DateTimeImmutable`; never an Entity/model/framework type): `readonly class CouponRedeemedEvent { public function __construct(public string $code) {} }`
+
+## E3 Entity carries events
+Entity is `readonly class` (never `final`). 1 An event-carrying Entity has `private array $domainEvents = []` (LAST ctor param) + `releaseEvents(): array`, added together with the FIRST behaviour method that raises an event; never scaffold them on an Entity without events. 2 EVERY behaviour method forwards events: `domainEvents: [...$this->domainEvents, new XEvent(...)]`. 3 `releaseEvents()` only returns, never clears. 4 An Entity rebuilt by the EntityMapper starts with an EMPTY list. 5 The Entity never dispatches.
+
+## E4 Write order (critical)
+Steps 1-3 inside the transaction (`run()`): 1 call the behaviour method -> NEW Entity with events. 2 `$events = $entity->releaseEvents();` from THAT Entity, BEFORE persisting. 3 `$saved = $repository->update($entity);` NEVER release from `$saved` (empty list). 4 Commit. 5 After commit: dispatch `$events` via `EventDispatcherContract`; push jobs via `QueueManagerContract`.
+Rules: never dispatch/push before commit or after rollback; dispatch `$events` once; a failed dispatch/push after commit is logged, the Result stays success, no rollback; a Query Service never raises, releases or dispatches.
+
+## E5 Dispatch port and adapters
+Port (`Core\Shared\Domain\Contracts`): `interface EventDispatcherContract { public function dispatch(object $event): void; }`. Laravel: `LaravelEventDispatcher` (final, forwards to the framework dispatcher). WordPress: `WpEventDispatcher`: `do_action('<prefix>_core_event', $event); do_action('<prefix>_core_event_' . $event::class, $event);`. No business logic, no framework types leaked. Core never calls `event()`, `Event::dispatch()`, `dispatch()`, `do_action()`. Bind once per environment.
+
+## E6 Listeners
+Framework-side adapter: reacts to an event and calls ONE Core Service method (or pushes a job). No business rule (put it in a Service/Entity). Laravel: register in a provider. WordPress: `add_action()` in the plugin bootstrap/provider `boot()`. A listener failure must not affect the committed write.
+
+## E7 Queue jobs and handlers
+Port: `interface QueueManagerContract { public function push(object $job, ?int $delaySeconds = null): void; }`. In `core/<Module>/Application/Jobs/`: `readonly class <Module><Action>Job` (plain scalars/arrays; never an Entity/model; never `ShouldQueue`) and `final class <Module><Action>JobHandler` with `handle(<Job> $job): void`. The handler is a delivery adapter: inject `<Module>CommandServiceContract`/`QueryServiceContract` (never the concrete Service), call ONE Command Service method, no business logic, idempotent where the use case allows (retries/failure handling belong to the adapter). Push jobs after commit from the Command Service.
+Adapters: Laravel framework job (`ShouldQueue`) wrapping the message and resolving the handler. WordPress: Action Scheduler (`as_enqueue_async_action`/`as_schedule_single_action`) or `wp_schedule_single_event` (identical hook+args scheduled close together are dropped: include a unique job id); a bootstrap hook resolves the handler from the container and calls `handle()`. Serialize safely: plain array/JSON and rebuild the message; never `unserialize` arbitrary classes.
+
+## E8 Forbidden (each fails review)
+Releasing events from the repository-returned Entity; a behaviour method that drops `$domainEvents`; dispatch/push before commit or after rollback; the Entity dispatching; dispatching twice from one Entity; turning a failed post-commit dispatch into a failed Result/rollback; an event/job extending a framework class or carrying an Entity/model; a business rule in a listener/handler; Core calling `event() dispatch() Queue::push() do_action()`; a Query Service dispatching; empty `$domainEvents`/`releaseEvents()` on an Entity that raises no events; binding a Contract more than once per environment.

@@ -1,0 +1,773 @@
+<?php
+declare(strict_types=1);
+
+namespace Framework\Support;
+
+use Framework\Http\Exceptions\HttpException;
+use Framework\Http\Responses\HtmlResponse;
+use Framework\Http\Responses\LayoutResponse;
+use Framework\Http\Responses\RedirectResponse;
+use Framework\Http\Responses\ViewResponse;
+
+/**
+ * Turns a view name into a rendered page.
+ *
+ * {@see ViewResponse} renders a PHP file but takes an absolute path, so a
+ * controller wanting one has to build that path itself
+ * (`base_path('views/leads/index.php')`), which is the moment a controller starts
+ * knowing where the project keeps its files: a delivery concern in the wrong
+ * layer, and the one thing a second project would have to change in every action.
+ *
+ * This class owns that knowledge. A controller asks for `'leads.index'` and gets
+ * back something it can hand to WordPress:
+ *
+ *     return $this->view('leads.index', ['leads' => $leads]);
+ *
+ * A service rather than a helper function, because beyond the dot-to-slash lookup
+ * it carries the view root (resolved once from `config('app.views')`) and a
+ * shared bag of data every view receives. A function would reach for config on
+ * every call and leave the shared bag in a global.
+ *
+ * The configured layout wraps every screen view behind the scenes, so a controller
+ * never builds the nesting by hand anymore:
+ *
+ *     return $this->view('leads.index', ['leads' => $leads])
+ *         ->withTitle('Leads');
+ *
+ * The child is rendered into `$content` and handed to the layout as its `$content`
+ * variable, with `$title` taken from the view's data or derived from the view name.
+ * There is no template language - just an extra plain PHP render. The wrapper only
+ * appears in {@see send()} and {@see render()}, so the response is still lazy.
+ * See {@see layout()} to change or disable it, and {@see make()} for the rule that
+ * a view named after the layout itself is returned unwrapped.
+ *
+ * No template syntax, no compilation, no cache. A view is a plain PHP file and the
+ * renderer includes it. Those features add a second language to learn and a compile
+ * step to debug, while what makes views pleasant to write (escaping, composition,
+ * knowing which variables exist) is available in plain PHP once escaping is
+ * convenient. See {@see e()} and {@see render()}.
+ */
+class ViewRenderer
+{
+    /** The layout name used when config names none. */
+    private const DEFAULT_LAYOUT = 'layout';
+
+    /**
+     * Data merged into every view this renderer renders.
+     *
+     * @var array<string, mixed>
+     */
+    private array $shared = [];
+
+    /**
+     * The absolute view root, resolved once.
+     *
+     * Resolved lazily rather than in the constructor because `app.views` is read
+     * through the static {@see \Framework\Config\Config} store, which a project
+     * populates at boot  -  a renderer resolved by a provider's `register()` would
+     * otherwise capture the default before the project had its say. Cached after
+     * the first read, because a render loop calling `config()` per view is one
+     * global lookup per view for a value that cannot change mid-request.
+     */
+    private ?string $root = null;
+
+
+    /**
+     * The configured layout that wraps every screen view.
+     *
+     * Null until resolved (via {@see resolveLayout()}); then an absolute path to
+     * the layout file. Set to an empty string to disable auto-wrapping.
+     *
+     * @var string|null
+     */
+    private ?string $layoutView = null;
+
+    /**
+     * A manual override installed by {@see layout()}.
+     *
+     * Consumed by {@see resolveLayout()} and discarded, so a one-off override
+     * does not change the config-derived default. `false` disables wrapping.
+     */
+    private false|string|null $manualLayout = null;
+
+
+    /**
+     * Render a view to a string.
+     *
+     * `$data` wins over the shared bag, which wins over the request's flashed
+     * payload  -  most specific last, so an action that names a variable gets the
+     * value it named.
+     *
+     * Auto-layout is not applied here: calling {@see render()} explicitly asks
+     * for that single view. It is {@see make()} that builds the response and
+     * applies the layout.
+     *
+     * @param array<string, mixed> $data
+     *
+     * @throws HttpException When the view is missing,
+     *                                                  or raises while rendering.
+     */
+    public function render(string $view, array $data = []): string
+    {
+        return $this->renderPath($this->path($view), $data);
+    }
+
+    /**
+     * Render an already-resolved view file with the layered variable set.
+     *
+     * The seam {@see make()} uses, and what a layout wrapper needs: by the time
+     * the layout is rendered its path has been resolved, and resolving it again
+     * as a *name* would mangle an absolute path. The layering (shared data,
+     * flash, errors, old input) is applied here, so a caller passing only
+     * `$content` and `$title` still gets every variable a view expects.
+     *
+     * @param array<string, mixed> $data
+     *
+     * @throws HttpException When the file is missing or raises while rendering.
+     */
+    public function renderPath(string $path, array $data = []): string
+    {
+        return (new ViewResponse($path, $this->gather($data)))->render();
+    }
+
+    /**
+     * Build a view response without rendering it.
+     *
+     * What a controller returns. Nothing is rendered until `send()`  -  or until a
+     * test calls `render()`  -  which is what keeps a controller's return value a
+     * value rather than a side effect.
+     *
+     * The response is always lazy: the child view is not rendered here. If the
+     * requested view is not the layout itself, {@see LayoutResponse} wraps it and
+     * performs the render at {@see \Framework\Http\Responses\LayoutResponse::send()}
+     * time - a separate render of the layout with the child as `$content` and a
+     * `$title` taken from the view's data or derived from its path. Callers that
+     * need the markup without sending can call {@see render()}.
+     *
+     * @param array<string, mixed>  $data
+     * @param array<string, string> $headers
+     *
+     * @see render() When the caller wants the markup as a string instead of a
+     *               response object.
+     */
+    public function make(string $view, array $data = [], int $status = 200, array $headers = []): ViewResponse|LayoutResponse
+    {
+        $path = $this->path($view);
+        $layout = $this->resolveLayout();
+
+        if ($layout !== '' && $path !== $layout) {
+            return new LayoutResponse(
+                new ViewResponse($path, $this->gather($data), $status, $headers),
+                $this,
+                $layout,
+                $view
+            );
+        }
+
+        return new ViewResponse($path, $this->gather($data), $status, $headers);
+    }
+
+    /**
+     * Change the layout for a request.
+     *
+     * The renderer is a singleton bound in {@see \Framework\Http\HttpServiceProvider},
+     * so a project can install an alternate layout from a provider's {@see
+     * ServiceProvider::boot()}:
+     *
+     *     app(ViewRenderer::class)->layout('emails.page');
+     *
+     * Setting it back to `false` disables auto-wrapping. The override applies to
+     * the renderer's lifetime, not to a single response.
+     *
+     * @param false|string $layout A view name, or false to disable wrapping.
+     */
+    public function layout(false|string $layout): static
+    {
+        $this->manualLayout = $layout;
+        $this->layoutView = null;
+
+        return $this;
+    }
+
+    /**
+     * Resolve the layout's absolute path from config (or the manual override),
+     * cached after the first read. An empty string means "do not wrap".
+     *
+     * @throws HttpException When a named layout cannot be found.
+     */
+    private function resolveLayout(): string
+    {
+        if ($this->manualLayout === false) {
+            return '';
+        }
+
+        if ($this->manualLayout !== null) {
+            $name = $this->manualLayout;
+            $this->manualLayout = null;
+
+            $this->layoutView = $this->resolveViewPathOrNull($name) ?? throw new HttpException(sprintf(
+                'The layout [%s] could not be found.',
+                $name
+            ));
+
+            return $this->layoutView;
+        }
+
+        if ($this->layoutView === null) {
+            $this->layoutView = $this->resolveLayoutView();
+        }
+
+        return $this->layoutView;
+    }
+
+    /**
+     * Resolve the layout name into an absolute path.
+     *
+     * The name `'layout'` is the framework's own default: when no such file sits
+     * beside the views, wrapping is switched off, so a project that ships no
+     * layout renders its screens plain instead of failing every one of them.
+     *
+     * Any other name was typed by the project, so it must exist — a typo there
+     * fails loudly rather than silently rendering an unwrapped page.
+     *
+     * @throws HttpException When a project-named layout cannot be found.
+     */
+    private function resolveLayoutView(): string
+    {
+        $configured = config('app.views.layout_view');
+
+        if ($configured === false) {
+            return '';
+        }
+
+        if (! is_string($configured) || trim($configured) === '') {
+            $configured = self::DEFAULT_LAYOUT;
+        }
+
+        $path = $this->resolveViewPathOrNull($configured);
+
+        if ($path !== null) {
+            return $path;
+        }
+
+        if ($configured === self::DEFAULT_LAYOUT) {
+            return '';
+        }
+
+        throw new HttpException(sprintf(
+            'The configured layout [%s] could not be found.',
+            $configured
+        ));
+    }
+
+    /**
+     * Resolve a view name to an absolute path, or null when it is not there.
+     */
+    private function resolveViewPathOrNull(string $view): ?string
+    {
+        $relative = str_replace('\\', '/', $view);
+
+        if ($this->escapesRoot($relative)) {
+            throw new HttpException(sprintf(
+                'The layout [%s] resolves outside the view root. A layout name may not contain a parent '
+                . 'directory segment.',
+                $view
+            ));
+        }
+
+        $dotted = $this->normalize(preg_replace('/\.php$/i', '', $relative) ?? $relative) . '.php';
+
+        $path = base_path_join($this->root(), $dotted);
+
+        if (is_file($path)) {
+            return $path;
+        }
+
+        $literal = base_path_join($this->root(), ltrim($relative, '/'));
+
+        return is_file($literal) ? $literal : null;
+    }
+
+    /**
+     * Resolve a view name to an absolute path.
+     *
+     * `'leads.index'` -> `<root>/leads/index.php`. Slashes work too, so a project
+     * that prefers `'leads/index'` is not fighting the renderer, and a trailing
+     * `.php` is accepted either way  -  `'leads.index'`, `'leads/index'` and
+     * `'leads.index.php'` all name the same file.
+     *
+     * A literal-filename fallback exists because dots mean both "directory
+     * separator" and "character in a filename", and the two are genuinely
+     * indistinguishable: `receipt.v2.php` could be that file or
+     * `receipt/v2.php`. Resolving dotted-first keeps the convention
+     * self-consistent but makes the literal name unreachable, so when the dotted
+     * reading finds nothing the name is tried verbatim. Both readings are checked
+     * against the filesystem rather than guessed from the string's shape, which is
+     * the only way to tell them apart.
+     *
+     * The fallback needs the whole trailing filename, so `receipt.v2.php` is
+     * reachable only when written with the extension. `receipt.v2` is never seen
+     * by the literal reading: the extension is appended before the lookup, so the
+     * fallback looks for a file called `receipt.v2`, which is not what was
+     * written. A literal filename must be spelled with its `.php`.
+     *
+     * A directory whose name contains a dot is unreachable. `v1.2/index.php`
+     * cannot be named: `'v1.2.index'` resolves to `<root>/v1/2/index.php`, and the
+     * slash spelling `'v1.2/index'` does not help because the dot in the final
+     * segment is substituted like the others. Only a name written with its
+     * extension survives, and then only via the literal fallback. That is a
+     * limitation of the dotted convention rather than this implementation; the
+     * practical answer is not to put a dot in a view directory's name. It is
+     * pinned by a test so it is documented rather than rediscovered from a 404.
+     *
+     * A parent segment is refused because view names routinely come from data (a
+     * settings screen storing "which template", a theme-style override table) and
+     * `../` in one is how a view name becomes an arbitrary file read. Normalizing
+     * would silently load something; refusing names the mistake. See
+     * {@see escapesRoot()} for why the check happens on the raw string.
+     *
+     * @throws HttpException When the name escapes the
+     *                                                  view root or resolves to a
+     *                                                  file that is not there.
+     */
+    public function path(string $view): string
+    {
+        $relative = str_replace('\\', '/', $view);
+
+        if ($this->escapesRoot($relative)) {
+            throw new HttpException(sprintf(
+                'View [%s] resolves outside the view root. A view name may not contain a parent '
+                . 'directory segment.',
+                $view
+            ));
+        }
+
+        // Even a name that already ends in `.php` is read dotted-first, because
+        // that is what keeps the convention self-consistent: `leads.index` and
+        // `leads.index.php` have to name the same file, and only the dotted
+        // reading makes them. `leads.index.php` is also the spelling a config
+        // file or a database column is most likely to hold.
+        $dotted = $this->normalize(preg_replace('/\.php$/i', '', $relative) ?? $relative) . '.php';
+
+        $path = base_path_join($this->root(), $dotted);
+
+        if (is_file($path)) {
+            return $path;
+        }
+
+        // Then the name verbatim, as a filename. This is what lets a caller hand
+        // over a real filename whose dots are *not* separators  - 
+        // `receipt.v2.php`, `report.final.php`  -  which the dotted reading would
+        // otherwise turn into `receipt/v2.php` and fail to find. Consulted only
+        // after the dotted reading misses, so the dotted convention keeps its
+        // meaning everywhere it can.
+        $literal = base_path_join($this->root(), ltrim($relative, '/'));
+
+        if (is_file($literal)) {
+            return $literal;
+        }
+
+        // Checked here rather than left to ViewResponse so the error names the
+        // *view* the caller asked for. The renderer's own message can only name
+        // the path it was handed, which by then is a file the caller never wrote
+        // a name for  -  and "views/leads/indx.php is missing" is a worse bug
+        // report than "view [leads.indx] is missing".
+        //
+        // Both candidates are named. A miss here means *two* different files were
+        // looked for, and which one the caller meant is exactly the thing they
+        // got wrong: a dotted name that should have been a literal filename (or
+        // the reverse) is invisible when the report lists only the dotted reading,
+        // and looks like a plain "file not found" in a directory they did not
+        // mean to address.
+        throw HttpException::viewNotFound($view, $dotted, $literal);
+    }
+
+    /**
+     * Render a view and return it wrapped in a response.
+     *
+     * The form a controller returns for a front-end page or a short admin screen.
+     * Rendering happens eagerly here rather than at `send()`, so a view that
+     * throws does so inside the action  -  where the caller still owns the response
+     *  -  instead of part-way through WordPress's output.
+     *
+     * @param array<string, mixed> $data
+     */
+    public function respond(string $view, array $data = [], int $status = 200): HtmlResponse
+    {
+        return new HtmlResponse($this->render($view, $data), $status);
+    }
+
+    /**
+     * Whether a view exists, without rendering it.
+     *
+     * The check a project needs for a template-override chain: look for the
+     * project's view, fall back to the plugin's, fall back to the framework's.
+     * Deliberately quiet about *why* a name is unusable  -  `..` reports false
+     * here rather than throwing, because this method's contract is "can I render
+     * this", and the answer to a name that escapes the root is no.
+     */
+    public function exists(string $view): bool
+    {
+        try {
+            $this->path($view);
+        } catch (HttpException) {
+            return false;
+        }
+
+        return true;
+    }
+
+
+    /**
+     * The absolute directory view names resolve against.
+     *
+     * Defaults to `<base>/views`. `config('app.views')` overrides it, either as
+     * an absolute path or as one relative to the project root  -  relative is the
+     * normal case, because an absolute path in a config file is a path that is
+     * wrong on every other machine, and the repo is what gets shared.
+     */
+    public function root(): string
+    {
+        if ($this->root !== null) {
+            return $this->root;
+        }
+
+        $configured = config('app.views');
+
+        if (is_string($configured) && trim($configured) !== '') {
+            // A Windows path or a rooted Unix one is already absolute. Testing
+            // both separators because a path written in config on one platform
+            // is routinely read on the other.
+            $this->root = preg_match('#^(?:[A-Za-z]:[\\\\/]|[\\\\/])#', $configured) === 1
+                ? rtrim($configured, '/\\')
+                : base_path($configured);
+
+            return $this->root;
+        }
+
+        $this->root = base_path('views');
+
+        return $this->root;
+    }
+
+    /**
+     * Point the renderer at a different directory.
+     *
+     * For a test that wants a fixture view without writing into the project's
+     * view directory, and for a project rendering a second set of templates  - 
+     * an email set, a PDF set  -  from one process.
+     */
+    public function setRoot(string $root): static
+    {
+        $this->root = rtrim($root, '/\\');
+
+        return $this;
+    }
+
+
+    /**
+     * Make a value available to every view.
+     *
+     * Returns `$this` so it composes with resolution:
+     * `app(ViewRenderer::class)->share('appName', config('app.name'))`.
+     */
+    public function share(string $key, mixed $value): static
+    {
+        $this->shared[$key] = $value;
+
+        return $this;
+    }
+
+    /**
+     * Make several values available to every view.
+     *
+     * @param array<string, mixed> $values
+     */
+    public function shareMany(array $values): static
+    {
+        foreach ($values as $key => $value) {
+            $this->share((string) $key, $value);
+        }
+
+        return $this;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function shared(): array
+    {
+        return $this->shared;
+    }
+
+    /**
+     * The per-field validation errors the view should render inline.
+     *
+     * This reads a transient rather than taking a variable because the errors
+     * arrive with the request landing after a redirect, and that request's action
+     * never saw them: they were flashed by the action that rejected the form, in
+     * the previous request. Threading them through every action's signature means
+     * every action forwarding a payload it does not use, and forgetting once
+     * produces a form that silently stops showing errors.
+     *
+     * The read is idempotent, where reading flash usually is not.
+     * {@see RedirectResponse::readFlash()} consumes, rightly, since a message
+     * readable twice reappears on refresh. Errors differ: one action may render a
+     * header and a form, both wanting them, and a partial rendered before they
+     * were read would come out empty. So the read happens once per renderer
+     * instance and is cached, while the transient is still consumed by that first
+     * read, so a refresh does not resurrect the errors either.
+     *
+     * @return array<string, list<string>>
+     */
+    public function errors(): array
+    {
+        $flash = $this->flash();
+
+        $errors = $flash['errors'] ?? [];
+
+        if (!is_array($errors) || $errors === []) {
+            return [];
+        }
+
+        $normalized = [];
+
+        foreach ($errors as $field => $messages) {
+            if (is_string($field)) {
+                $normalized[$field] = $this->toList($messages);
+            }
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * One field's messages, for an inline `<span>` beside the input.
+     *
+     * @return list<string>
+     */
+    public function errorsFor(string $field): array
+    {
+        return $this->errors()[$field] ?? [];
+    }
+
+    /**
+     * The first message for one field, or null.
+     *
+     * What an input's error slot almost always wants: showing all three things
+     * wrong with one box is noise.
+     */
+    public function firstError(string $field): ?string
+    {
+        return $this->errorsFor($field)[0] ?? null;
+    }
+
+    /**
+     * Whether the given field failed validation.
+     *
+     * The hook a view uses to add `class="field-invalid"` without repeating the
+     * error text, and the reason this is a method rather than leaving the view to
+     * call `errorsFor()` and test it  -  an empty list and a missing field are the
+     * same answer, and a view should not have to know that.
+     */
+    public function hasError(string $field): bool
+    {
+        return $this->errorsFor($field) !== [];
+    }
+
+    /**
+     * The input the user submitted, for re-populating the form.
+     *
+     * Flashed by the same failed validation that produced {@see errors()}, and
+     * read from the same cache  -  see the note there on why one read serves both.
+     * Values are returned **raw**; escaping them is the view's job, through
+     * {@see old()} or {@see e()}.
+     *
+     * @return array<string, mixed>
+     */
+    public function old(): array
+    {
+        $old = $this->flash()['old'] ?? [];
+
+        return is_array($old) ? $old : [];
+    }
+
+    /**
+     * One submitted value, or a default.
+     *
+     * @param mixed $default
+     * @return mixed
+     */
+    public function oldValue(string $field, mixed $default = null): mixed
+    {
+        return $this->old()[$field] ?? $default;
+    }
+
+    /**
+     * Every flash value the previous request left, consumed.
+     *
+     * Cached per instance for the reason given on {@see errors()}: the transient
+     * is destroyed by the read, so a second uncached read would come back empty
+     * and a page that rendered a notice in two places would render it once.
+     *
+     * @return array<string, mixed>
+     */
+    public function flash(): array
+    {
+        if ($this->flash === null) {
+            $this->flash = $this->loadFlash();
+        }
+
+        return $this->flash;
+    }
+
+    /**
+     * One flash value, or a default.
+     *
+     * The general form of what a "saved successfully" notice reads:
+     * `$view->flash('notice')`.
+     *
+     * @param mixed $default
+     * @return mixed
+     */
+    public function flashValue(string $key, mixed $default = null): mixed
+    {
+        return $this->flash()[$key] ?? $default;
+    }
+
+
+    /**
+     * The cached flash payload, or null before it has been read.
+     *
+     * @var array<string, mixed>|null
+     */
+    private ?array $flash = null;
+
+    /**
+     * Build the full variable set for one render.
+     *
+     * Layered explicitly rather than with `array_merge` of everything at once, so
+     * the precedence is readable at the call site  -  this is the order in which a
+     * value is overridden, and getting it backwards means an action cannot
+     * override a shared value or a shared value silently beats a flashed one.
+     *
+     * The flash block is **absent** when nothing was flashed, rather than present
+     * as empty arrays. A view that checks `isset($errors)` then behaves the same
+     * as one that checks `$errors !== []`, and neither has to guess what an
+     * empty payload means.
+     *
+     * @param array<string, mixed> $data
+     *
+     * @return array<string, mixed>
+     */
+    private function gather(array $data): array
+    {
+        $variables = $this->shared;
+
+        $flash = $this->flash();
+
+        $errors = $this->errors();
+
+        if ($errors !== []) {
+            $variables['errors'] = $errors;
+        }
+
+        $old = $this->old();
+
+        if ($old !== []) {
+            $variables['old'] = $old;
+        }
+
+        if (array_key_exists('error', $flash)) {
+            $variables['error'] = $flash['error'];
+        }
+
+        if (array_key_exists('notice', $flash)) {
+            $variables['notice'] = $flash['notice'];
+        }
+
+        // $data last: an action that names a variable means it, and the renderer
+        // is not in a position to know better than the code that wrote the view.
+        return array_replace($variables, $data);
+    }
+
+    /**
+     * Read the flash payload from WordPress, or from a request-bound fallback.
+     *
+     * @return array<string, mixed>
+     */
+    private function loadFlash(): array
+    {
+        // The only source. An earlier draft also consulted the request, to help a
+        // test avoid two round trips  -  and it was removed, because it made the
+        // flash *two* stores with a silent precedence rule between them, and a
+        // second store that can shadow the first is how a "the errors stopped
+        // showing up" bug becomes unguessable. A test writes to the transient
+        // instead; see Tests\Support\FlashStore.
+        return RedirectResponse::readFlash();
+    }
+
+    /**
+     * Whether a view name tries to climb out of the view root.
+     *
+     * A substring test rather than a segment split, because the obvious
+     * implementation (split on separators, look for a `'..'` segment) fails in the
+     * unsafe direction. Dots are the delimiter this renderer substitutes, so `..`
+     * is itself a run of separators: splitting `'../secret'` on `[./]+` yields
+     * `['', 'secret']`, and the parent segment has already vanished by the time
+     * anything could look for it. That guard compiles, runs, and never fires once.
+     *
+     * So the check is on the raw text, before anything is substituted. Any `..`
+     * is refused, including in a name like `leads..index` where it is harmless  - 
+     * a view file with two consecutive dots in its name is not a thing anyone
+     * writes, and the cost of refusing one is a clearer error than the cost of
+     * letting an escape through is a file read.
+     */
+    private function escapesRoot(string $view): bool
+    {
+        return str_contains($view, '..');
+    }
+
+    /**
+     * Turn a relative view path into the slash form used for lookup.
+     *
+     * Collapses the doubled separators the dot substitution can produce, and
+     * strips leading ones, so `'.leads.index'` and `'leads.index'` agree.
+     */
+    private function normalize(string $relative): string
+    {
+        $segments = array_values(array_filter(
+            explode('/', str_replace('.', '/', $relative)),
+            static fn (string $segment): bool => $segment !== ''
+        ));
+
+        return implode('/', $segments);
+    }
+
+    /**
+     * Coerce a message, or a list of them, into a list.
+     *
+     * A flashed payload may carry a single string where a list is expected  -  a
+     * hand-written `->with('errors', ['email' => 'Required'])` does exactly that,
+     * and it is a natural thing for a project to write. Normalizing here means a
+     * view's loop does not have to guard, which is the difference between one
+     * line of defensive code and one in every template.
+     *
+     * @return list<string>
+     */
+    private function toList(mixed $messages): array
+    {
+        if (is_string($messages)) {
+            return [$messages];
+        }
+
+        if (!is_array($messages)) {
+            return [];
+        }
+
+        return array_values(array_map(
+            static fn (mixed $message): string => is_scalar($message) ? (string) $message : '',
+            array_filter($messages, static fn (mixed $message): bool => is_scalar($message))
+        ));
+    }
+}

@@ -1,0 +1,112 @@
+# ---------------------------------------------------------------
+# Dependency directories
+# ---------------------------------------------------------------
+# vendor/ is rebuilt from composer.json + composer.lock. Note that
+# vendor/devlinkstudios/wp-mini-laravel-framework is a symlink into
+# ./framework (path repository), so the framework source is committed
+# separately and never lives inside vendor.
+/vendor
+node_modules/
+/tests
+/tools
+
+# composer.lock IS committed on purpose: reproducible dependency
+# resolution across machines and deploys.
+
+# ---------------------------------------------------------------
+# Build & tooling artifacts
+# ---------------------------------------------------------------
+# PHPUnit cache only. The test suite (tests/) and phpunit.xml are
+# COMMITTED on purpose: CI/CD and collaborators need them. They are
+# stripped from production archives via .gitattributes export-ignore.
+.phpunit.cache/
+.phpunit.result.cache
+.probe-tmp
+
+# Local audit reports. Regenerated per audit run, addressed to whoever ran
+# it, and stale the moment the next one lands — a committed copy is a
+# record of findings that have since been fixed. Kept out of the tree so
+# the report stays a working document rather than becoming a claim about
+# the current state of the code.
+/.audit/
+# IDE & Tooling folders
+.audit/
+
+# .claude/ IS COMMITTED ON PURPOSE — never re-add a `.claude/` line here.
+# Goodbye to the structural rule ONE DIRECTORY UP: the line below ignores
+# `.claude/` at every depth (skills are nested two levels down). The rule is
+# `.claude/*` plus `!.claude/rules/` and `!.claude/skills/` instead: it drops
+# local settings/cache, and it cannot be undone later by a negation — git never
+# re-includes a file inside an excluded DIRECTORY. Deeper junk needs its own
+# `.claude/.gitignore`, which is read wherever the tree is cloned.
+.claude/*
+!.claude/rules/
+!.claude/skills/
+
+# PHP CS Fixer / PHPStan / Psalm / Rector
+.php-cs-fixer.cache
+.php-cs-fixer.php
+.php-cs-fixer.dist.php
+/phpstan.neon
+/phpstan.neon.dist
+/psalm.xml
+/psalm.xml.dist
+/rector.php
+/phpdoc.xml
+/phpdoc.xml.dist
+
+# ---------------------------------------------------------------
+# WordPress specific
+# ---------------------------------------------------------------
+wp-content/debug.log
+.htaccess
+
+# ---------------------------------------------------------------
+# Environment files
+# ---------------------------------------------------------------
+# Keep the example templates so new installs know what to define.
+.env
+.env.*
+!.env.example
+!.env.dist
+
+# ---------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+composer.phar
+
+# Build / runtime output directories
+/logs/
+/build/
+/dist/
+
+# WP-CLI downloaded by the `mini` entry point on a machine that has none lives
+# in the system temporary directory, not here — so there is no entry to add.
+# It was `/.cli-cache/` until a cached phar inside the plugin was found to hold
+# a Windows share lock, which made WordPress fail to delete or update the
+# plugin. A stray `.cli-cache/` from an older checkout can be deleted by hand.
+
+# ---------------------------------------------------------------
+# IDE & Editor files
+# ---------------------------------------------------------------
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# ---------------------------------------------------------------
+# OS files
+# ---------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini

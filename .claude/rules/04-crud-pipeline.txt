@@ -1,0 +1,53 @@
+# 04 CRUD PIPELINE (STRICT; WordPress edition)
+Load when implementing CRUD/use-case logic on an already-scaffolded module (example: Coupon). Binding. Read with 02; Fluent Database is paused (write repositories use `$wpdb` via `BaseWriteRepository`, read repositories via `BaseReadRepository`).
+
+## STEP 1 REQUEST DTO (DEFERRED: built only when that Create/Update feature is implemented)
+`core/<Module>/Application/DTOs/Requests/<Module><Action>DTO` (`CouponCreateDTO`), `readonly class`: promoted readonly props ONLY; uploaded files typed `mixed` (never a framework type); one immutable `with*()` clone per derived/deferred schema field (`withSlug()`, `withStoreImage()`/`withLogo()`), each returning a NEW instance that re-passes EVERY promoted property by name. A `with*()` may reference only existing ctor properties: keep props, Request Mapper and `with*()` in lock-step.
+STATIC-FACTORY PROHIBITION: never `fromArray()`/`fromRequest()`/`fromValidated()` or any member depending on a framework request. All request-to-DTO translation lives in the Request Mapper (Step 4), never in the DTO or a Controller.
+INPUT RULES: P2 money is a `string`, formatted to the column scale once in the Request Mapper. P3 a field decided by a state transition is not client input (FormRequest refuses it); do not add a DTO property just because the column exists. P4 "unchanged" vs "clear": `null` = unchanged, an explicit `bool $clearThumbnail = false` per clearable field.
+```php
+readonly class CouponCreateDTO
+{
+    public function __construct(public string $code, public mixed $image = null /* uploaded file: always mixed */) {}
+    // public function withSlug(string $slug): self { return new self(code: $this->code, slug: $slug, ...); } // new instance, never mutate
+}
+```
+
+## STEP 2 CONTRACTS AND REPOSITORIES (decide the side BEFORE writing a method)
+- WRITE: `Domain/Contracts/<Module>RepositoryContract` (pure Entities), adapter `Wp<Module>WriteRepository extends BaseWriteRepository`. Only state changes (`create(entity)`, `update(entity)`, `delete(id)`) plus `findByIdForUpdate()`; NEVER a pure read (`findById`, `findByEmail`, listings, `getFormOptions()`). Test: is the read separable from the write it protects?
+- READ: `Application/Contracts/<Module>QueryContract`, adapter `Wp<Module>ReadRepository extends BaseReadRepository` (which inherits no write method, so a read adapter that can write is impossible by inheritance); prepared SELECT/JOIN on `$wpdb`; returns read models/Domain types. Query Services and delivery inject it for reads.
+- One adapter never implements both ports; a narrow read surface (`<Module>FormOptionsContract`) gets its own port + adapter; a Controller injects the read port for reads and the write port for writes, never both for one concern.
+- Declare only what the use case needs (ISP). `$wpdb` appears only in the adapter, which converts row -> Entity via `<Module>EntityMapper` and returns Domain types only. Repository methods take/return ENTITIES; `toPersistenceArray(entity)` (keys = columns exactly, enums `->value`) feeds `$wpdb`. Legacy `<Module>Data`/`toArray()` modules keep it until migrated.
+- C6 LIST LABELS: a list page needing related labels (company/contact/stage name) gets them IN THE READ QUERY (SQL JOIN) inside `ReadModels/<Module>ProjectionDTO`. A Controller never calls `getFormOptions()` or loads lookup tables to map IDs in memory (N+1 in disguise).
+- ROW LOCK: read-then-write loads with `findByIdForUpdate(int $id): ?<Module>Entity` (declared on the contract, implemented via `BaseWriteRepository::findRecordForUpdate()`, i.e. `FOR UPDATE`), inside the transaction. Standard name in every module (never `findByIdWithLock`, `findForUpdate`, `lockById`). Plain `findById()` takes no lock: reads and the post-write refresh only.
+- RACE-SAFE UNIQUENESS: every uniqueness rule has a UNIQUE index; `WpQueryExceptionTranslator` rethrows the duplicate-key failure as `DuplicateKeyException` or the module's conflict exception (`<Module>DuplicateException`, `<Module>SlugConflictException`); the Command Service catches it and returns `Result::failure` with a domain key. A Service never imports/catches a persistence exception.
+
+## STEP 3 SERVICE IMPLEMENTATION
+A Service is an orchestrator: ports + DTOs only, no business rules, returns `Result`, never throws for control flow. Entity-raised domain exceptions are caught in the Service and converted to `Result::failure`.
+WRITE FLOW (Command Service), all inside the transaction (`executeInTransaction()`, AGENTS s10):
+1 Mapper builds the DTO: `$this->mapper->mapToCreateDTO($request->validated())`. 2 Call `$couponCommandService->createCoupon($couponCreateDTO)`. 3 Apply uploads and derived fields HERE (`SlugGeneratorContract`, `FileUploaderContract`, DTO `with*()` clones). 4 Create via named constructor OR load via the write port (`findByIdForUpdate()` when modifying) and call a behaviour method. 5 `$events = $entity->releaseEvents()` from the event-carrying Entity BEFORE persisting. 6 `create(entity)`/`update(entity)` returns the persisted Entity (no events; never release from it). 7 Commit; the failure path cleans up (delete a newly uploaded file) and returns `Result::failure` (built AFTER the rollback). 8 AFTER commit: dispatch `$events` via `EventDispatcherContract`, push jobs via `QueueManagerContract`, delete replaced files. 9 `ResponseMapper::toResponseDTO(entity)` -> `Result::success($responseDTO)` | `Result::failure($msg, $code)`.
+READ FLOW (Query Service): no transaction/events/writes; READ port -> read model/Domain types -> ResponseMapper -> `Result`. Delivery checks `isFailure()` and returns view/redirect/JSON/CLI output.
+RESULT: every use-case method returns the Shared `Result` (success/failure, data, message, optional `errorCode`). `errorCode` = DOMAIN keys (`CATEGORY_SLUG_CONFLICT`), never HTTP statuses (delivery maps). Domain exceptions (`CouponNotFoundException`) are caught inside the Service; none leak upward.
+TRANSACTIONS: every mutating use case (Command Services only) runs in `TransactionManagerContract::run()` via `executeInTransaction()`; never `DB::` or a framework/manual transaction call. A failure after a write is THROWN; never swallow a Throwable after a write (partial work would commit). The row lock is taken inside the transaction. Old files, events, jobs are handled AFTER commit, never on rollback.
+SHARED UTILITIES: slugs via `SlugGeneratorContract` (`generate($sourceValue)` = pure transformation; `generateUniqueSlug(sourceValue: $sourceValue, table: '<table>')` when uniqueness is needed, bounded `-<n>` suffix; never hide a DB check behind a plain transformation name); media via `FileUploaderContract`. Reuse Shared blocks; never re-invent.
+STYLE: named arguments for multi-parameter calls (`$this->uploader->upload(file: $file, directory: 'brands');`), positional for one; semantic variable names; rules in the Entity (Tell, Don't Ask). ENTITY IMMUTABILITY: load -> behaviour method -> use the NEW instance; never assign to an Entity property or "modify then save the same object"; if the loaded Entity is discarded and only the returned instance is persisted, that is a defect; every Entity is `readonly class`, never `final`. Events/jobs only via the ports; never `event()`, `dispatch()`, `Queue::push()`, `do_action()` in `core/`.
+
+## STEP 4 RESPONSE DTO AND MAPPERS
+Never expose an Entity to a view/JSON/CLI: every Service returns `Result` with a `<Module>ResponseDTO` (or list); one DTO serves API, Web, Console, WordPress. Presentation concerns (formatted values, resolved URLs) go in `<Module>ResponseMapper::toResponseDTO(entity)`; row -> Entity stays in Infrastructure `<Module>EntityMapper`.
+REQUEST MAPPER (STRICT): every module has `<Module>Mapper` implementing `<Module>MapperContract` (`Application/Contracts/`, adapter in `Application/Mappers/`). It receives a PLAIN ARRAY (validated data), never a FormRequest/framework class, and is the ONLY request-to-DTO translation point; one `mapToCreateDTO()`/`mapToUpdateDTO()` per use case. Bind once in the module provider.
+```php
+interface CouponMapperContract { public function mapToCreateDTO(array $validatedData): CouponCreateDTO; }
+final class CouponMapper implements CouponMapperContract
+{
+    public function mapToCreateDTO(array $validatedData): CouponCreateDTO
+    {
+        return new CouponCreateDTO(code: $validatedData['code'], image: $validatedData['image'] ?? null);
+    }
+}
+```
+
+## STEP 5 DELIVERY (THIN CONTROLLER; template in 03 s7.11)
+FormRequest = validation rules only. The Controller constructor-injects the module's INBOUND CONTRACTS (`CouponCommandServiceContract`, `CouponQueryServiceContract`) and `CouponMapperContract` (always `$mapper`), never the concrete Service; `store()`/`update()` receive ONLY the FormRequest. Flow: `$request->validated()` -> Mapper -> ONE Service method -> guard-clause `isFailure()` (translation boundary, allowed; business `if`s live in core). Never `DTO::fromArray()`. A route maps URL -> Controller method, nothing else. Each port is bound once in the module provider; only Shared ports in `AppServiceProvider`.
+
+## DEFINITION OF DONE (CRUD FEATURE; tests paused)
+[ ] Strict types; namespace matches path. [ ] Domain no framework imports; Application only ports/DTOs/Shared. [ ] All I/O behind a port; `$wpdb` only in Infrastructure. [ ] `Result` returned; no exception leaks. [ ] Row <-> Entity via mapper. [ ] WRITE port <- `Wp<Module>WriteRepository extends BaseWriteRepository`; READ port <- `Wp<Module>ReadRepository extends BaseReadRepository`; no pure read on the write port. [ ] Both persistence ports, `<Module>MapperContract` and both service contracts bound once in the module provider (listed in `config/app.php`). [ ] Delivery thin, no `fromArray()`. [ ] Controllers inject service contracts. [ ] Entities/DTOs immutable, `readonly class`, not `final`. [ ] Rules in the Entity. [ ] Service is Command OR Query; Query Services never write/dispatch/open transactions and use the READ port only. [ ] ResponseDTO in `Result`, never an Entity/row. [ ] List labels resolved in the read query. [ ] Money is `string`. [ ] Read-then-write via `findByIdForUpdate()`. [ ] No persistence exception in a Service; duplicate key via Shared/module exception. [ ] Events/jobs after commit via ports. [ ] Every write in `run()`. [ ] Guard clause on `isFailure()`. [ ] `composer dump-autoload` after new namespace paths.

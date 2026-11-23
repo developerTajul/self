@@ -1,0 +1,133 @@
+# 03 MODULE SCAFFOLDING (STRICT; WordPress edition)
+Load ONLY when scaffolding a NEW module (example: Coupon). Binding. Model on `core/Category` for STRUCTURE only; Service shape, Entity design and event/queue wiring follow AGENTS.md, not older shapes. Fluent Database is paused: write repositories use `$wpdb` through `BaseWriteRepository`, read repositories through `BaseReadRepository` (02 s7).
+SCAFFOLD ONLY (01 P1.5): signatures + `// TODO:`; NO business logic, NO use-case methods (EMPTY-SKELETON GUARD). Request DTOs and Request Mappers (`<Module>Mapper` + `<Module>MapperContract`) are DEFERRED to 04.
+
+## GUARDRAILS
+1 No speculation about missing sources; inputs are only the workspace tree and the developer's schema/command. 2 MISSING-BUT-MANDATED => CREATE IMMEDIATELY (FULL-BASELINE MANDATE, Shared utilities, member rules): no warning, no confirmation. 3 Exact command only; EXEMPT: creating missing Shared Infrastructure adapters for newly injected ports (`AbstractWpRepository`, `BaseWriteRepository`, `BaseReadRepository`, `WpTransactionManager`, `WpQueryExceptionTranslator`, `WpSlugChecker`, `WpFileUploader`, `WpEventDispatcher`, `WpQueueManager`, `WpTranslator` in `core/Shared/Infrastructure/`). 4 YAGNI never trims the baseline.
+
+## 7.1 TREE
+```
+core/Coupon/
+  Domain/{Entities/CouponEntity.php, Contracts/CouponRepositoryContract.php (WRITE port), Exceptions/CouponNotFoundException.php}
+  Application/{Contracts/CouponQueryContract.php (READ port), Contracts/CouponCommandServiceContract.php, Contracts/CouponQueryServiceContract.php,
+              DTOs/Responses/CouponResponseDTO.php, Mappers/CouponResponseMapper.php, Services/CouponCommandService.php, Services/CouponQueryService.php}
+  Infrastructure/{Repositories/WpCouponWriteRepository.php (extends BaseWriteRepository), Repositories/WpCouponReadRepository.php (extends BaseReadRepository), Mappers/CouponEntityMapper.php}
+app/Providers/CouponServiceProvider.php   composition root (P1)
+```
+Two ports, two adapters, never one shared repository. The WRITE port exchanges pure Entities and declares only writes plus `findByIdForUpdate(int $id)`; listings/lookups go on the READ port (`Application/Contracts/`). One adapter never implements both. A narrow extra read surface gets its own port + adapter. Inbound service contracts are scaffolded as empty interfaces with `// TODO:`; each Service `implements` its contract; bind the four ports in the module provider listed in `config/app.php` (INHERENT WIRING). NOT scaffolded: `Domain/Events/`, `Application/Jobs/` (only when a use case needs them), `Domain/DataObjects/` (legacy).
+FULL-BASELINE MANDATE: a new-module scaffold generates ALL artifacts of the tree whether or not a use case asked yet; a scaffold with only the requested artifacts is INCOMPLETE. Schema-implied structural support = CONSTRUCTOR WIRING ONLY: `slug` column => `SlugGeneratorContract`; `thumbnail/image/file` column => `FileUploaderContract`; any other schema-implied utility with an existing Shared contract (02 s2.3) => inject it; never invent a Shared port.
+
+## SlugGenerator (sanctioned exception: complete implementation)
+Schema has `slug`: if `core/Shared/Infrastructure/Utilities/SlugGenerator.php` exists reuse it (never fork); else generate it (namespace `Core\Shared\Infrastructure\Utilities`) fully: strict types; ctor-inject `SlugCheckerContract`; `MAX_ATTEMPTS = 100` in a bounded FOR loop, `RuntimeException` on exhaustion; multi-byte truncation (`mb_substr`) to the 255 VARCHAR limit reserving suffix room, trim trailing dash; Unicode slug (`~[^\pL\pN]+~u` -> dash, collapse, trim, `mb_strtolower`; Bangla-safe); `implements SlugGeneratorContract` (`generate(string $sourceValue): string`, `generateUniqueSlug(string $sourceValue, string $table): string`; create the contract in Shared Domain if missing).
+
+## BASE REPOSITORIES (`$wpdb`; NEVER an empty skeleton)
+Three classes in `core/Shared/Infrastructure/Repositories/`, splitting the connection layer from read and write capability so a read adapter cannot inherit a write method.
+
+**`AbstractWpRepository.php`** — `abstract class AbstractWpRepository`. The connection layer ONLY: ctor (promoted, only param) `protected ?wpdb $wpdb = null`, plus `db()` (resolves the `$wpdb` global lazily on first use, because providers build repositories during `register()` before WordPress loads it), `tableName(string $table): string` (prefix + suffix) and `escapeIdentifier(string $identifier): string`. NO read and NO write method. Both classes below extend it.
+
+**`BaseWriteRepository.php`** — `abstract class BaseWriteRepository extends AbstractWpRepository`. The write helpers. `$table` is passed PER CALL as a suffix constant (`self::TABLE_SUFFIX`), not a ctor param.
+| Helper | Logic |
+| --- | --- |
+| `insert(array $values, string $table, string $action): int` | `$wpdb->insert()` with `formatsFor()`; failure throws; id `insert_id`, and id <= 0 is a failure (a caller given 0 would write `WHERE id = 0`) |
+| `write(int $id, array $values, string $table, string $action): void` | hand-built prepared `UPDATE ... SET`, so a null compiles to the `NULL` keyword (never `$wpdb->update()`, which skips null columns); a 0-row result re-checks existence |
+| `deleteRecord(int $id, string $table, string $action): bool` | prepared `DELETE FROM ... WHERE id = %d`; `false` from the driver is a FAILURE (throws), 0 rows is `false` without throwing, so the child decides not-found vs no-op |
+| `findRecordForUpdate(int $id, string $table, string $action): ?array` | prepared `SELECT * FROM ... WHERE id = %d LIMIT 1 FOR UPDATE` (inside a transaction); null + `last_error` = failed statement, not an absent row |
+| `rowExists(int $id, string $table): bool` | `COUNT(*)`; null + `last_error` = failure |
+| `executeQuery(string $action, callable $operation): mixed` | runs a write, translates failure; the callback throws the driver's own text (never a prefixed message) |
+| `duplicateException(Throwable): Throwable` | override hook: a module returns its own conflict exception |
+| `throwIfDuplicate()`, `now()`, `formatsFor()`, `quoteColumn()`, `placeholderFor()` | duplicate detection from `last_error`, UTC timestamp, `%d`/`%f`/`%s` choices, qualified-column quoting |
+
+**`BaseReadRepository.php`** — `abstract class BaseReadRepository extends AbstractWpRepository`. Shared read helpers only: `findRecordById(int $id, string $table): ?array` (prepared `SELECT * ... LIMIT 1`) and `rowExists(int $id, string $table): bool` (prepared `SELECT COUNT(*)`). If either returns `null` while `$wpdb->last_error !== ''`, throw `\RuntimeException`; an absent row with no database error remains a normal `null`/`false` result. It inherits no write method and adds no `FOR UPDATE` lock, preserving the CQRS split.
+Every value goes through `prepare()`/format arrays; table/column names are code constants; no raw user data in SQL; a failed statement raises rather than reading as an empty result.
+
+## 7.1.1 MEMBER RULES (derive everything from the PROVIDED schema; never invent or omit columns)
+Entity and Enum are FULLY implemented at scaffold time (mechanical schema mapping); Services, Contracts, Repositories stay empty skeletons; Entity BEHAVIOUR methods (rules, transitions, `create()`) are business logic: `// TODO:` until the use case.
+- ENTITY (`Domain/Entities/`): `readonly class` (never `final`), promoted ctor, one property per column, types match the schema exactly (nullable -> `?type`, enum -> Domain enum); `id` is ALWAYS `?int`. Pure. Do NOT scaffold `$domainEvents`/`releaseEvents()` until the FIRST behaviour method raises an event; then add both and every behaviour method forwards the list (08).
+- ENUM (`Domain/Enums/`, only if the schema has enum/state columns): cases mirror schema values; MUST have `translationKey(): string` (stable lang key like `'lead.status.pending'`) and `static values(): array` (`array_column(self::cases(), 'value')`). No hardcoded display strings, no `label()` with English.
+- REQUEST DTO (`Application/DTOs/Requests/`, DEFERRED): promoted readonly props only (no static factories) + an immutable `with*()` clone per derived field (`withSlug()`, `withStoreImage()`); uploaded files typed `mixed`; a `with*()` references only existing ctor properties (else "Unknown named parameter"): keep props, Request Mapper and `with*()` in lock-step.
+- SCHEMA-CONDITIONAL INJECTION (Command Service ctor): `slug` => `SlugGeneratorContract` (never the concrete one; it holds `SlugCheckerContract`); `thumbnail/image/file` => `FileUploaderContract`. A Service missing a schema-implied port is INCOMPLETE. The Query Service never gets slug/upload ports.
+- ADAPTER CO-GENERATION: injecting a Shared port (`TransactionManagerContract`, `EventDispatcherContract`, `QueueManagerContract`, `SlugGeneratorContract` + `WpSlugChecker`, `FileUploaderContract`) means its adapter must exist in `core/Shared/Infrastructure/`; if missing, generate it fully, without asking.
+- EMPTY-SKELETON GUARD: Services, Contracts, Repositories get ONLY constructors and injections.
+
+## TEMPLATES (generic TODO stubs; against a real migration apply 7.1.1 in full)
+```php
+// Domain/Entities/CouponEntity.php: namespace Core\Coupon\Domain\Entities;
+readonly class CouponEntity
+{
+    public function __construct(public ?int $id, public string $code /* TODO: schema fields */) {}
+    // TODO: create(...) and behaviour methods (isExpired(), redeem()): enforce invariants, return a NEW instance.
+}
+// Domain/Contracts/CouponRepositoryContract.php (WRITE port): only the ops use cases need + findByIdForUpdate(int $id). TODO.
+// Application/Contracts/CouponQueryContract.php (READ port): only reads; returns read models/Domain types. TODO.
+// Application/DTOs/Responses/CouponResponseDTO.php: readonly class (int $id, string $code /* presentation-safe */)
+// Application/Mappers/CouponResponseMapper.php: final; toResponseDTO(CouponEntity $entity): CouponResponseDTO  // (int) $entity->id
+```
+COMMAND SERVICE injects: repository contract, response mapper, `TransactionManagerContract`, `EventDispatcherContract`, `LoggerInterface`, plus schema-implied `SlugGeneratorContract`/`FileUploaderContract`; `QueueManagerContract` only if queued work; `TranslatorContract` only when a use case produces user-facing messages. QUERY SERVICE injects ONLY the READ port, response mapper, logger (never transaction manager, dispatcher, slug/upload ports, or the write port).
+```php
+final class CouponCommandService implements CouponCommandServiceContract
+{
+    public function __construct(
+        private readonly CouponRepositoryContract $couponRepository,
+        private readonly CouponResponseMapper $responseMapper,
+        private readonly TransactionManagerContract $transactionManager,
+        private readonly EventDispatcherContract $eventDispatcher,
+        private readonly LoggerInterface $logger,
+    ) {}
+}
+final class WpCouponWriteRepository extends BaseWriteRepository implements CouponRepositoryContract
+{
+    private const TABLE = 'coupons';
+    public function __construct(private readonly CouponEntityMapper $mapper, ?\wpdb $wpdb = null)
+    {
+        parent::__construct($wpdb);
+    }
+}
+final class WpCouponReadRepository extends BaseReadRepository implements CouponQueryContract // no write method in the inherited chain
+{
+    private const TABLE = 'coupons';
+    public function __construct(private readonly CouponEntityMapper $mapper, ?\wpdb $wpdb = null)
+    {
+        parent::__construct($wpdb);
+    } // reads: prepared SELECT/JOIN on $wpdb->prefix . self::TABLE
+}
+final class CouponEntityMapper // Infrastructure/Mappers
+{
+    public function toEntity(array $data): CouponEntity {} // TODO: explicit casts for every column: new CouponEntity(id: (int) $data['id'], code: (string) $data['code'])
+    public function toPersistenceArray(CouponEntity $entity): array {} // keys = column names exactly; enums via ->value; skip id and timestamps
+}
+```
+Docblocks per AGENTS s13: "Handles coupon write use cases." + `@implements <FQCN>`; the Query Service "Handles coupon read use cases. Never changes state."
+
+## 7.10 WIRING (P1)
+Module ports bind in `app/Providers/CouponServiceProvider.php` (NOT `AppServiceProvider`), listed in `config/app.php`:
+```php
+final class CouponServiceProvider extends ServiceProvider // framework provider base
+{
+    public function register(): void
+    {
+        $this->container->bind(CouponRepositoryContract::class, WpCouponWriteRepository::class);
+        $this->container->bind(CouponQueryContract::class, WpCouponReadRepository::class);
+        $this->container->bind(CouponCommandServiceContract::class, CouponCommandService::class);
+        $this->container->bind(CouponQueryServiceContract::class, CouponQueryService::class);
+        $this->container->bind(CouponMapperContract::class, CouponMapper::class);
+    }
+}
+```
+SHARED ports in `AppServiceProvider` (bound once): `EventDispatcherContract` -> `WpEventDispatcher`, `QueueManagerContract` -> `WpQueueManager`, `TransactionManagerContract` -> `WpTransactionManager`, `TranslatorContract` -> `WpTranslator`, `SlugGeneratorContract` -> `SlugGenerator` (+ `SlugCheckerContract` -> `WpSlugChecker`), `\wpdb` instance. Adapter config arrives as scalars via contextual binding (02 s5); never inject `Config`.
+
+## 7.11 DELIVERY: THIN CONTROLLER (in `app/`, not `core/`)
+- Constructor receives the module's INBOUND CONTRACTS it uses (`CouponCommandServiceContract`, `CouponQueryServiceContract`) AND `CouponMapperContract`; never the concrete Service. `store()`/`update()` receive ONLY the FormRequest; every other dependency comes via the constructor. The injected mapper is always `$mapper`.
+- The MapperContract takes a plain `array` (never a FormRequest): `$this->mapper->mapToCreateDTO($request->validated())`. The Service handles uploads (`FileUploaderContract`) and derived fields (`with*()`) and returns `Result`; the Controller guard-clauses `isFailure()`. Controllers never call `DTO::fromArray()` (must not exist).
+```php
+final class CouponController extends Controller // framework/Routing base class (verify)
+{
+    public function __construct(private readonly CouponCommandServiceContract $couponCommandService, private readonly CouponMapperContract $mapper) {}
+    public function store(CouponStoreRequest $request): mixed
+    {
+        $couponCreateDTO = $this->mapper->mapToCreateDTO($request->validated());
+        $result = $this->couponCommandService->createCoupon($couponCreateDTO);
+        if ($result->isFailure()) { /* TODO: redirect back with the error notice + old input (framework/Http helpers) */ }
+        /* TODO: redirect to the index route with the success notice */
+    }
+}
+```

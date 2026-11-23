@@ -1,0 +1,57 @@
+# 06 PORTS, ADAPTERS, PORTABILITY (ANY FRAMEWORK <-> THIS WORDPRESS PLUGIN)
+Binding. Load when adding a port/adapter, touching Shared, porting `core/` in either direction, or running the port audit. Events/queues: 08. Freeze rules: AGENTS.md section 3.
+GOAL: Domain + Application run unchanged in Laravel, any PHP framework and this plugin. A new environment = new Infrastructure + composition root + delivery.
+
+## T1 PURITY BOUNDARY (FROZEN folders)
+FORBIDDEN in `core/*/Domain`, `core/*/Application`, `core/Shared/{Domain,Application}`: imports from `Illuminate\*`, `App\*`, `Framework\*`; facades and helpers (`Event::`, `Queue::`, `Storage::`, `DB::`, `Cache::`, `Log::`, `Route::`, `event() dispatch() now() app() config() env() request() auth() view() route() redirect() trans() base_path()`); WordPress symbols (`do_action apply_filters add_action wp_* $wpdb get_option current_user_can esc_* sanitize_* WP_Query WP_Error`); ORM models, collections, paginators, request/response objects, framework exceptions; concrete adapters (`new WpEventDispatcher`). ALLOWED: PHP built-ins, PSR interfaces, other Core code, Contracts. Framework-aware code lives only in `core/*/Infrastructure`, `app/`, `framework/`, the entry file.
+
+## T2 PORTS -> ADAPTERS
+Anything Core needs from outside is a `...Contract` in Core implemented outside the FROZEN folders (create a port only when the task needs it; YAGNI never covers the mandated baseline).
+| Port | WordPress (this repo) | Laravel (reference) |
+| --- | --- | --- |
+| `<Module>RepositoryContract` (WRITE) | `Wp<Module>WriteRepository` extends `BaseWriteRepository` | `Eloquent<Module>WriteRepository` extends `BaseWriteRepository` |
+| `<Module>QueryContract` (READ) | `Wp<Module>ReadRepository` extends `BaseReadRepository` | `Eloquent<Module>ReadRepository` extends `BaseReadRepository` |
+| `TransactionManagerContract` | `WpTransactionManager` / `CompensatingActionTransactionManager` | `LaravelTransactionManager` |
+| `EventDispatcherContract` / `QueueManagerContract` | `WpEventDispatcher` / `WpQueueManager` | `LaravelEventDispatcher` / `LaravelQueueManager` |
+| `FileUploaderContract`, `SlugCheckerContract`, `TranslatorContract` | `WpFileUploader`, `WpSlugChecker`, `WpTranslator` | `LaravelFileUploader`, `EloquentSlugChecker`, `LaravelTranslator` |
+| `PasswordHasherContract`, `TokenGeneratorContract` | `WpPasswordHasher`, `WpTokenGenerator` | `LaravelPasswordHasher`, `SanctumTokenGenerator` |
+| `ClockContract`, `SlugGeneratorContract`, `LoggerInterface` | `SystemClock`, `SlugGenerator`, `WpLogger` | same / Laravel logger |
+Rules: ports are small, use-case-shaped (ISP); adapters hold NO business logic and leak no platform types; an adapter is a drop-in (Liskov) and rethrows platform failures as `\RuntimeException` (duplicate key -> `DuplicateKeyException`); only the prefix (`Wp`, `Eloquent`, `Laravel`) differs between environments.
+
+## T5 COMPOSITION ROOTS
+One place per environment per Contract. This plugin: shared ports in `AppServiceProvider`, module ports in `<Module>ServiceProvider`, providers listed in `config/app.php` (02 s5). Laravel: `AppServiceProvider` + module providers in `bootstrap/providers.php`. Core never instantiates an adapter or reads a container.
+
+## T6 PERSISTENCE PORTABILITY
+Core assumes no storage shape; the Entity is all a Command Service and the WRITE port exchange; the READ port exchanges read models. The split is a Core rule and survives porting: TWO adapters per module. Each environment writes its OWN EntityMapper (row -> Entity, Entity -> persistence array); never copy another environment's. Pagination uses Core's `PaginatedResult`. Transactions only via `TransactionManagerContract`. The schema is part of the environment (Laravel migrations vs `database/migrations`) and must mirror types, nullability, enums, UNIQUE indexes.
+
+## T7 DELIVERY
+All channels: validate -> Request Mapper builds the Request DTO from a PLAIN ARRAY -> ONE Command/Query Service method -> format the ResponseDTO. WordPress: admin screen/admin-post/AJAX/REST with nonce + capability. Laravel: FormRequest + controller. Console: arguments -> array -> mapper. The mapper contract takes a plain `array`, never a framework request.
+
+## T8 PORT AUDIT (before reporting done, when `core/` is touched; report ONLY real command output)
+A. Zero matches expected:
+```
+grep -rnE "Illuminate\\\\|\\bApp\\\\|\\bFramework\\\\|Facades\\\\|\\\$wpdb|\\bWP_[A-Za-z_]+|\\b(do_action|apply_filters|add_action|add_filter|get_option|update_option|current_user_can|get_current_user_id)\\(|\\b(wp|esc|sanitize)_[a-z_]+\\(" core/*/Domain core/*/Application core/Shared/Domain core/Shared/Application
+grep -rnE "(^|[^>:[:alnum:]_])(event|dispatch|now|app|config|env|request|view|route|redirect|trans|auth|cache|session|base_path)\\(" core/*/Domain core/*/Application core/Shared/Domain core/Shared/Application
+```
+B. Infrastructure imports no delivery/framework zone (zero matches): `grep -rnE "\\bApp\\\\|\\bFramework\\\\" core/*/Infrastructure core/Shared/Infrastructure`
+C. After a port: `bash tools/port-audit.sh <source-core> <mirror-core> [VendorPrefix]`; exit 0 = FROZEN folders identical. Any diff: fix the SOURCE, re-port, never hand-edit the mirror. On a grep match introduce or use a port; never suppress the check.
+
+## T9 PORTING
+A. ANY FRAMEWORK -> THIS PLUGIN: 1 identify the source `core/` (developer names it). 2 Copy FROZEN folders unchanged; do NOT copy its `Infrastructure/`. 3 Set the namespace prefix by rebrander/script, `composer dump-autoload` (a wrong PSR-4 prefix fails silently). 4 List every Contract used. 5 Write one WordPress adapter per Contract; a missing Shared contract is added ADDITIVELY in the source's `Shared/Domain` and re-ported, never by editing a module. 6 Write each module's EntityMapper and migration (mirror the source schema). 7 Composition root: shared in `AppServiceProvider`, one provider per module, listed in `config/app.php`. 8 Delivery (routes, controllers, FormRequests, views) calling the same inbound contracts. 9 Register listeners/queue hooks (08). 10 Run T8 A, B, C. 11 Any step needing a FROZEN edit = design leak: fix the source port, restart at 2.
+B. THIS PLUGIN -> ANOTHER FRAMEWORK: mirror the steps; drop `Wp*` adapters.
+C. COOKBOOK Eloquent -> `$wpdb` (translate the CONTRACT's behaviour, not the calls):
+| Eloquent | `$wpdb` in `Wp<Module>...Repository` |
+| --- | --- |
+| `create($data)` | `$wpdb->insert($table,$data,$formats)`; id `$wpdb->insert_id`; re-read; map |
+| `find($id)` | `get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id = %d",$id), ARRAY_A)` |
+| `lockForUpdate()->find()` | same SELECT + `FOR UPDATE` inside `WpTransactionManager::run()` |
+| dirty `save()` | `$wpdb->update($table,$data,['id'=>$id],$formats,['%d'])`; 0 rows is not an error |
+| `destroy($id)` | `$wpdb->delete($table,['id'=>$id],['%d'])` |
+| `paginate($n)` | `COUNT(*)` + `LIMIT %d OFFSET %d` -> `PaginatedResult` |
+| JOIN/projection | `get_results($wpdb->prepare(...), ARRAY_A)` in the READ adapter -> ProjectionDTO |
+| casts / `getAttributes()` | none: every column is a string, cast in `toEntity()` |
+| duplicate `QueryException` | `WpQueryExceptionTranslator` -> `DuplicateKeyException` |
+| `DB::transaction()` | `WpTransactionManager::run()` |
+
+## T10 DEFINITION OF DONE
+[ ] T8 A/B zero matches; T8 C identical (after a port). [ ] FROZEN files not hand-edited; only the prefix differs, by tool. [ ] Every new outside capability = Contract in Core + adapter outside. [ ] Two persistence adapters per module (write extends `BaseWriteRepository`, read extends `BaseReadRepository`, which inherits no write method). [ ] No business logic or platform types in adapters. [ ] Duplicate key arrives as a Shared Domain/module conflict exception. [ ] Delivery injects inbound contracts. [ ] Events/jobs plain PHP, dispatched after commit. [ ] Each Contract bound once per environment. [ ] Port method names describe the domain operation. [ ] Request Mapper takes a plain array. (Tests paused.)

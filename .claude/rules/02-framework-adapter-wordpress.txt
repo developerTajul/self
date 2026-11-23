@@ -1,0 +1,80 @@
+# 02 WORDPRESS ADAPTER (this repo: Laravel-shaped WP plugin + core/ modules)
+Binding; wins over 01 on conflict. Load when touching app/, config/, routes/, views/, database/, a provider, a core/*/Infrastructure adapter, the entry file, lang files, or porting. Tests paused (no 07).
+
+## 1 STACK
+PHP 8.2+, WordPress 6.0+, Composer, `declare(strict_types=1);`. DI: `devlinkstudios/wp-service-container` (PSR-11, autowiring; API: bind, singleton, instance, resolve, alias, extend, when()->needs()->give(), call, register, boot; check its README before using anything else). Named arguments for multi-parameter calls and boolean flags.
+
+## 2 STRUCTURE
+```
+wp-mini-laravel.php (entry)  mini (CLI)  uninstall.php  composer.json  .env(.example)
+framework/    JOB F only (10)
+app/          Kernel, Console, Http/{Controllers,Middleware,Requests,Resources}, Providers   (delivery + composition root)
+config/       app.php (identity, paths, `providers` list): the ONLY place env() is called
+routes/       web.php (admin, front-end), api.php (REST)      views/  PHP templates, escape with e()
+database/migrations/                                          docs/ai-plans, docs/ai-reports
+core/<Module>/{Domain,Application,Infrastructure}   core/Shared/{Domain,Application,Infrastructure}
+```
+No `app/Models`: no ORM, rows are plain arrays. Adapters never live in `app/`.
+| Path | Does | MUST NOT |
+| --- | --- | --- |
+| routes | URL -> controller via the `Route` facade | contain logic |
+| Controllers | FormRequest -> Mapper -> ONE Service contract call -> translate Result | business rules, SQL, repositories, `$wpdb` |
+| Requests | validation (`Framework\Http\FormRequest`) | persist/transform |
+| Middleware / Resources | guards (capability, nonce) / shape a ResponseDTO | rules / read rows |
+| `AppServiceProvider` | shared ports | module bindings |
+| `<Module>ServiceProvider` | ONE module's ports | other modules |
+
+Core module (`core/<Module>/`): Domain (Entities, Events, Contracts[WRITE port], ValueObjects, ReadModels, Rules, Enums, Exceptions), Application (Services, Jobs, Contracts[READ port, MapperContract, inbound service contracts], DTOs, Mappers), Infrastructure (`Repositories/Wp<Module>WriteRepository extends BaseWriteRepository`, `Repositories/Wp<Module>ReadRepository extends BaseReadRepository`, `Mappers/<Module>EntityMapper`: row array -> Entity, Entity -> persistence array, row -> ProjectionDTO). Two ports, two adapters, never one shared repository.
+
+### 2.3 Shared adapters (`core/Shared/Infrastructure/`; REUSE, never re-invent)
+| Port | Adapter | Notes |
+| --- | --- | --- |
+| `TransactionManagerContract` | `WpTransactionManager` (`Database/`) | `$wpdb` START TRANSACTION/COMMIT/ROLLBACK, depth-counted, singleton, InnoDB. CPT modules: `CompensatingActionTransactionManager` |
+| `EventDispatcherContract` | `WpEventDispatcher` | `do_action('<prefix>_core_event', $event)` + per-class action (08). singleton |
+| `QueueManagerContract` | `WpQueueManager` | Action Scheduler if present, else `wp_schedule_single_event`; safe serialization (08) |
+| `TranslatorContract` | `WpTranslator` | key-based, section 8 |
+| `FileUploaderContract` | `WpFileUploader` | `wp_handle_upload` |
+| `SlugCheckerContract` / `SlugGeneratorContract` | `WpSlugChecker` / `SlugGenerator` | `$wpdb` uniqueness check |
+| `PasswordHasherContract`, `TokenGeneratorContract` | `WpPasswordHasher`, `WpTokenGenerator` | `wp_hash_password`/`wp_check_password`; `random_bytes`, store only a hash |
+| `ClockContract` | `SystemClock` | UTC |
+| `Psr\Log\LoggerInterface` | `WpLogger` | WordPress debug log. singleton |
+| (none) | `AbstractWpRepository` (abstract, connection layer), `BaseWriteRepository` (abstract, write helpers), `BaseReadRepository` (abstract, shared read helpers), `WpQueryExceptionTranslator` | 03; the ONE translator turns a failed `$wpdb` call (MySQL errno 1062) into `DuplicateKeyException`. The three bases split connection from read/write so a read adapter inherits no write method. |
+`Result` and `PaginatedResult` are Core types.
+
+## 3 BOOT ORDER (DO NOT REORDER)
+1 Entry file requires `vendor/autoload.php`, loads `.env` via `\Dotenv\Dotenv::createImmutable(__DIR__)->safeLoad()`. 2 Helper files autoload via Composer; global `config()` delegates to `Framework\Config\Config`. 3 Entry binds `path.base`, loads `config/*.php` into `Config::$items`. 4 `App\Kernel` registers the providers listed in `config/app.php`. 5 `app()->boot()` runs on `plugins_loaded`.
+
+## 4 CONFIG AND ENV
+`env()` only inside `config/*.php`, once at load, never in `App\`, `Core\`, routes, views. `config/*.php` is the single source of truth, read via `config()` in entry/providers/routes/views or an injected `Config` in `app/` classes. Core and Infrastructure never receive `Config` (D2): a provider reads the value and passes a scalar via contextual binding. An empty `.env` value becomes `null` and erases the config fallback: fill it or delete it.
+
+## 5 COMPOSITION ROOT AND DI
+1 Providers: `register()` = bindings only (never resolve, never hooks); `boot()` = hooks and anything that resolves.
+2 Shared ports bind once in `AppServiceProvider`; module ports in `<Module>ServiceProvider`; both listed in `config/app.php`; one binding per Contract. Every Contract is bound explicitly (no guessing).
+3 Lifetimes: `singleton` for `TransactionManagerContract`, `EventDispatcherContract`, `QueueManagerContract`, `TranslatorContract`, `LoggerInterface`, `\wpdb`; `bind` for the rest unless an adapter holds state.
+4 `\wpdb` enters once: `$container->instance(\wpdb::class, $GLOBALS['wpdb']);` in `AppServiceProvider`. Repositories type-hint `\wpdb`; Core never sees it.
+5 Scalars for adapters: `$this->container->when(WpLeadReadRepository::class)->needs('$perPageLimit')->give((int) config('app.per_page_limit'));`
+6 No service locator outside entry/providers/routes/config/views/hook callbacks. Hook callbacks needing dependencies use `$container->call([Handler::class, 'method'])`. One container per plugin, plugin-scoped accessor, no cross-plugin static.
+7 Delivery injects inbound service contracts and `<Module>MapperContract`, never concrete Services.
+
+## 6 DELIVERY FLOW
+Route (`Framework\Support\Facades\Route`; web.php admin/front-end, api.php REST) -> Middleware (capability, nonce) -> Controller -> FormRequest -> `<Module>MapperContract` builds the Request DTO from a PLAIN ARRAY -> ONE Service method -> `Result` -> view/redirect/JsonResource. Guard clause on `isFailure()`; delivery maps error KEYS to status/notice. Delivery resolves the current user (`get_current_user_id()`) into the DTO (P14). A domain violation surfaces as a `\DomainException` subclass; the framework handler may map it to 422; Core never throws a framework HTTP exception. Console: `php mini <command>` -> plain array -> mapper -> Service -> output. Routes: group prefix/name/middleware with the framework route-group API; use the generator controller shapes (`make:controller --resource|--api|--invokable`); never one line per verb for CRUD; do not assume Laravel helpers (`Route::resource`) exist: check `framework/Routing`.
+
+## 7 PERSISTENCE (`$wpdb`, while Fluent is paused: D6)
+1 SQL lives ONLY in `BaseWriteRepository`/`BaseReadRepository` helpers and Read adapters. Every value goes through `$wpdb->prepare()` or `insert/update/delete` with a format array. Table/column names are code constants, never request data; dynamic ordering uses a whitelist. No `%i` placeholder (WP 6.0 floor). Shared reads on `BaseReadRepository` are `findRecordById()` and `rowExists()`; null results with non-empty `$wpdb->last_error` throw `\RuntimeException`.
+2 Tables: `$wpdb->prefix . '<name>'`, created ONLY by migrations (`database/migrations`); adapters never alter schema; `dbDelta()` is CREATE-only. Transactional tables are InnoDB (verify the Schema builder emits `ENGINE=InnoDB`; MyISAM silently ignores transactions and `FOR UPDATE`). CPT/meta modules: no transaction, use the compensating manager; `WP_Query`/`get_post_meta` only inside that module's adapters.
+3 ROW LOCK: `findByIdForUpdate()` = `SELECT ... WHERE id = %d FOR UPDATE` via `BaseWriteRepository::findRecordForUpdate()`, inside a transaction.
+4 `$wpdb` returns every column as a string: fetch `ARRAY_A`; `EntityMapper::toEntity(array $row)` casts explicitly (`(int)`, `(string)`, `(bool)`, `DateTimeImmutable`, enum `from()/tryFrom()`).
+5 Time is stored in UTC; `ClockContract` is UTC; site-timezone conversion only in delivery (`wp_date()`).
+6 Failures: `$wpdb` helpers return `false` on error and `0` rows for "nothing changed". `false` = failure (check `$wpdb->last_error`, throw `\RuntimeException` without SQL/schema in the message); `0` on update is not a failure. Silent failure is forbidden.
+7 DUPLICATE KEY: only `WpQueryExceptionTranslator` recognizes it (MySQL errno 1062, never message text in repositories) and throws `DuplicateKeyException` or the module's conflict exception. A UNIQUE index backs every uniqueness rule.
+8 Pagination: `COUNT(*)` + `LIMIT/OFFSET` -> `PaginatedResult`. List labels come from a JOIN in the READ adapter (04 C6). Mapping rows: plain `array_map` into Entities/ProjectionDTOs.
+
+## 8 SECURITY AND LOCALIZATION
+- Every admin-post, AJAX and REST write verifies nonce AND capability BEFORE the Service runs (middleware/handler, never inside Core). `wp_unslash()` request data; validate/sanitize in FormRequest (the mapper types/formats only). Escape on output (`e()`, `esc_html/attr/url`, `wp_kses_post`); JSON via JsonResource. Entry file guards `defined('ABSPATH') || exit;`, library/Core classes never do. Secrets only via `.env` -> `config/`. Uninstall cleanup in `uninstall.php` and lifecycle classes (`Framework\Lifecycle`), not in modules.
+- `WpTranslator` is KEY-BASED (D5): reads `lang/<locale>/<module>.php` (same files/keys as the Laravel project), locale from `determine_locale()`. `__()` only for delivery-layer labels. `errorCode` values stay untranslated keys.
+
+## 9 OVERRIDE TABLE (Laravel wording -> this repo)
+`bootstrap/providers.php` -> `providers` list in `config/app.php` | `$this->app->bind` -> `$this->container->bind` | `Eloquent<Module>...Repository` -> `Wp<Module>...Repository` | Eloquent `BaseRepository` -> `$wpdb` `AbstractWpRepository` + `BaseWriteRepository`/`BaseReadRepository` (same protected-helper rule, split so a read adapter cannot write) | `app/Models`, `getAttributes()` -> the `ARRAY_A` row | `lockForUpdate()` -> `SELECT ... FOR UPDATE` | `paginate()` -> `COUNT` + `LIMIT/OFFSET` -> `PaginatedResult` | `LaravelTransactionManager/EventDispatcher/QueueManager/Translator` -> `Wp...` | `Route::resource()` -> framework controller shapes | `FormRequest::validated()` -> `Framework\Http\FormRequest` validated array | Blade/`view()` -> `views/*.php`, `e()` | `php artisan` -> `php mini` | `lang/` + `trans()` -> same files via `WpTranslator`. Anything uncovered: AGENTS.md and the Port Freeze decide.
+
+## 10 DEFINITION OF DONE
+[ ] Mode named. [ ] No `env()` outside `config/`; no `Config` in Core/Infrastructure. [ ] Adapter imports only Core, WordPress, PHP, PSR; leaks no `$wpdb`/WP type upward. [ ] Every SQL value prepared; identifiers constants; InnoDB. [ ] Row -> Entity via mapper with explicit casts; UTC. [ ] Duplicate key only via `WpQueryExceptionTranslator`. [ ] Each Contract bound once, provider listed in `config/app.php`. [ ] Controllers inject inbound contracts + MapperContract; nonce + capability; output escaped. [ ] `framework/`, `vendor/` untouched. (Tests paused.)
