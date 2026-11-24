@@ -3,20 +3,7 @@
 declare(strict_types=1);
 
 use App\Http\Controllers\Admin\CompanyController;
-use App\Http\Controllers\Admin\DashboardController;
 use Framework\Support\Facades\Route;
-
-// ---------------------------------------------------------------------------- dashboard
-
-Route::get('wp-mini-laravel', [DashboardController::class, 'index'])
-    ->name('dashboard.index')
-    ->middleware(['auth', 'capability:manage_options'])
-    ->withOptions([
-        'page_title' => 'WP Mini Laravel',
-        'menu_title' => 'WP Mini Laravel',
-        'capability' => 'manage_options',
-        'position'   => 25,
-    ]);
 
 // ---------------------------------------------------------------------------- companies
 

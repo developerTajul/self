@@ -24,8 +24,7 @@ interface CompanyQueryContract
     public function getFilteredCompanies(CompanyFilter $filter): PaginatedResult;
 
     /**
-     * Returns one company together with its contacts, deals, deal stages and
-     * deal activities.
+     * Returns one company as a detail read model.
      *
      * @param int $companyId
      *
@@ -34,8 +33,7 @@ interface CompanyQueryContract
     public function findDetailById(int $companyId): ?CompanyDetailData;
 
     /**
-     * Returns one company on its own, without the related records the detail
-     * read drags in.
+     * Returns one company on its own, as an entity the caller can act on.
      *
      * @param int $companyId
      *

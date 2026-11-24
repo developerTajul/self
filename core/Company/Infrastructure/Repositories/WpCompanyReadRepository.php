@@ -7,10 +7,6 @@ namespace Core\Company\Infrastructure\Repositories;
 use Core\Company\Application\Contracts\CompanyQueryContract;
 use Core\Company\Domain\DataObjects\CompanyDetailData;
 use Core\Company\Domain\Entities\CompanyEntity;
-use Core\Company\Domain\ReadModels\CompanyActivityProjectionDTO;
-use Core\Company\Domain\ReadModels\CompanyContactProjectionDTO;
-use Core\Company\Domain\ReadModels\CompanyDealProjectionDTO;
-use Core\Company\Domain\ReadModels\CompanyDealStageProjectionDTO;
 use Core\Company\Domain\ReadModels\CompanyProjectionDTO;
 use Core\Company\Domain\ValueObjects\CompanyFilter;
 use Core\Company\Infrastructure\Mappers\CompanyEntityMapper;
@@ -34,30 +30,6 @@ final class WpCompanyReadRepository extends BaseReadRepository implements Compan
 {
     /** The table's name without the WordPress prefix. */
     public const TABLE_SUFFIX = 'companies';
-
-    /** Table suffix for the contact/company pivot. */
-    private const COMPANY_CONTACT_TABLE = 'company_contact';
-
-    /** Table suffix for contacts. */
-    private const CONTACTS_TABLE = 'contacts';
-
-    /** Table suffix for deals. */
-    private const DEALS_TABLE = 'deals';
-
-    /** Table suffix for deal stages. */
-    private const DEAL_STAGES_TABLE = 'deal_stages';
-
-    /** Table suffix for activities. */
-    private const ACTIVITIES_TABLE = 'activities';
-
-    /** Table suffix for the WordPress users table. */
-    private const USERS_TABLE = 'users';
-
-    /** Morph alias a company's own activities are stored under. */
-    private const COMPANY_TRACKABLE_TYPE = 'company';
-
-    /** Morph alias a deal's activities are stored under. */
-    private const DEAL_TRACKABLE_TYPE = 'deal';
 
     private const OUTPUT_ASSOC = ARRAY_A;
 
@@ -173,8 +145,7 @@ final class WpCompanyReadRepository extends BaseReadRepository implements Compan
     }
 
     /**
-     * Returns one company with its contacts, deals, deal stages and deal
-     * activities.
+     * Returns one company as a detail read model.
      *
      * @param int $companyId
      *
@@ -197,271 +168,6 @@ final class WpCompanyReadRepository extends BaseReadRepository implements Compan
             address: $company->address,
             createdAt: $company->createdAt,
             updatedAt: $company->updatedAt,
-            contacts: $this->contactsFor($companyId),
-            deals: $this->dealsFor($companyId),
-            activities: $this->activitiesFor($companyId),
-        );
-    }
-
-    // ------------------------------------------------------------------ joins
-
-    /**
-     * The contacts linked to a company, carrying the pivot's own fields.
-     *
-     * @param int $companyId
-     *
-     * @return list<CompanyContactProjectionDTO>
-     */
-    private function contactsFor(int $companyId): array
-    {
-        $pivot = $this->column(self::COMPANY_CONTACT_TABLE);
-        $contacts = $this->column(self::CONTACTS_TABLE);
-
-        $rows = $this->rows(
-            $this->prepare(
-                sprintf(
-                    'SELECT %s, %s, %s, %s, %s, %s '
-                    . 'FROM %s INNER JOIN %s ON %s = %s '
-                    . 'WHERE %s = %%d '
-                    . 'ORDER BY %s DESC, %s ASC',
-                    "{$pivot}.`id`",
-                    "{$contacts}.`name`",
-                    "{$contacts}.`email`",
-                    "{$contacts}.`phone`",
-                    // `job_title` and `is_primary` belong to the pivot, not the
-                    // contact: the same person can hold a different title at each
-                    // company. `id` is the pivot's row id for that reason.
-                    "{$pivot}.`job_title`",
-                    "{$pivot}.`is_primary`",
-                    $this->tableName(self::COMPANY_CONTACT_TABLE),
-                    $this->tableName(self::CONTACTS_TABLE),
-                    "{$contacts}.`id`",
-                    "{$pivot}.`contact_id`",
-                    "{$pivot}.`company_id`",
-                    "{$pivot}.`is_primary`",
-                    "{$contacts}.`name`"
-                ),
-                [$companyId]
-            ),
-            'read the contacts of company ' . $companyId
-        );
-
-        return array_map(
-            fn (array $row): CompanyContactProjectionDTO => new CompanyContactProjectionDTO(
-                id: (int) $row['id'],
-                name: (string) $row['name'],
-                email: $this->toNullableString($row['email'] ?? null),
-                phone: $this->toNullableString($row['phone'] ?? null),
-                jobTitle: $this->toNullableString($row['job_title'] ?? null),
-                // MySQL returns a TINYINT as a string; `(bool) '0'` is false,
-                // which is what the column means. A missing flag also reads as
-                // false, which is the column's own default.
-                isPrimary: (bool) ($row['is_primary'] ?? false),
-            ),
-            $rows
-        );
-    }
-
-    /**
-     * The deals opened against a company, each with its stage and activities.
-     *
-     * @param int $companyId
-     *
-     * @return list<CompanyDealProjectionDTO>
-     */
-    private function dealsFor(int $companyId): array
-    {
-        $deals = $this->column(self::DEALS_TABLE);
-        $stages = $this->column(self::DEAL_STAGES_TABLE);
-
-        $rows = $this->rows(
-            $this->prepare(
-                sprintf(
-                    'SELECT %s, %s, %s, %s, %s, %s, '
-                    . '%s AS `stage_id`, %s AS `stage_name`, '
-                    . '%s AS `stage_order_position`, %s AS `stage_probability` '
-                    . 'FROM %s LEFT JOIN %s ON %s = %s '
-                    . 'WHERE %s = %%d '
-                    . 'ORDER BY %s DESC, %s DESC',
-                    "{$deals}.`id`",
-                    "{$deals}.`title`",
-                    "{$deals}.`amount`",
-                    "{$deals}.`currency`",
-                    "{$deals}.`expected_close_date`",
-                    "{$deals}.`actual_close_date`",
-                    "{$stages}.`id`",
-                    "{$stages}.`name`",
-                    "{$stages}.`order_position`",
-                    "{$stages}.`probability`",
-                    $this->tableName(self::DEALS_TABLE),
-                    $this->tableName(self::DEAL_STAGES_TABLE),
-                    "{$stages}.`id`",
-                    "{$deals}.`deal_stage_id`",
-                    "{$deals}.`company_id`",
-                    "{$deals}.`created_at`",
-                    "{$deals}.`id`"
-                ),
-                [$companyId]
-            ),
-            'read the deals of company ' . $companyId
-        );
-
-        // The deals' activities are read once for the company rather than once
-        // per deal: a single query beats N queries, and the grouping happens in
-        // PHP where it is visible.
-        $activitiesByDeal = $this->activitiesGroupedByDeal($companyId);
-
-        return array_map(
-            fn (array $row): CompanyDealProjectionDTO => new CompanyDealProjectionDTO(
-                id: (int) $row['id'],
-                title: (string) $row['title'],
-                // P2: decimal money is a string. Casting to float would lose the
-                // exactness the column was widened to `DECIMAL(15,2)` for.
-                amount: (string) $row['amount'],
-                currency: (string) $row['currency'],
-                expectedCloseDate: $this->toNullableString($row['expected_close_date'] ?? null),
-                actualCloseDate: $this->toNullableString($row['actual_close_date'] ?? null),
-                stage: $this->toStageProjection($row),
-                activities: $activitiesByDeal[(int) $row['id']] ?? [],
-            ),
-            $rows
-        );
-    }
-
-    /**
-     * The company's own activities, which are stored against the company rather
-     * than against one of its deals.
-     *
-     * @param int $companyId
-     *
-     * @return list<CompanyActivityProjectionDTO>
-     */
-    private function activitiesFor(int $companyId): array
-    {
-        $activities = $this->column(self::ACTIVITIES_TABLE);
-
-        $rows = $this->rows(
-            $this->activityQuery(
-                sprintf(
-                    'WHERE %s = %%s AND %s = %%d',
-                    "{$activities}.`trackable_type`",
-                    "{$activities}.`trackable_id`"
-                ),
-                [self::COMPANY_TRACKABLE_TYPE, $companyId]
-            ),
-            'read the activities of company ' . $companyId
-        );
-
-        return array_values(array_map(
-            fn (array $row): CompanyActivityProjectionDTO => $this->toActivityProjection($row),
-            $rows
-        ));
-    }
-
-    /**
-     * The company's deal activities, grouped by deal.
-     *
-     * @param int $companyId
-     *
-     * @return array<int, list<CompanyActivityProjectionDTO>>
-     */
-    private function activitiesGroupedByDeal(int $companyId): array
-    {
-        $dealRows = $this->rows(
-            $this->prepare(
-                sprintf(
-                    'SELECT `id` FROM `%s` WHERE `company_id` = %%d',
-                    $this->escapeIdentifier($this->tableName(self::DEALS_TABLE))
-                ),
-                [$companyId]
-            ),
-            'read the deal ids of company ' . $companyId
-        );
-
-        $dealIds = array_map(static fn (array $row): int => (int) $row['id'], $dealRows);
-
-        if ($dealIds === []) {
-            return [];
-        }
-
-        // `whereIn` has no bound-parameter form, so the placeholders are
-        // generated one per id and the ids are bound through `prepare()`. The
-        // ids are ints cast from a column, never text from a request.
-        $placeholders = implode(', ', array_fill(0, count($dealIds), '%d'));
-
-        $rows = $this->rows(
-            $this->activityQuery(
-                sprintf(
-                    'WHERE %s = %%s AND %s IN (%s)',
-                    "{$this->column(self::ACTIVITIES_TABLE)}.`trackable_type`",
-                    "{$this->column(self::ACTIVITIES_TABLE)}.`trackable_id`",
-                    $placeholders
-                ),
-                [self::DEAL_TRACKABLE_TYPE, ...$dealIds]
-            ),
-            'read the deal activities of company ' . $companyId
-        );
-
-        $grouped = [];
-
-        foreach ($rows as $row) {
-            $trackableId = (int) $row['trackable_id'];
-
-            $grouped[$trackableId] ??= [];
-            $grouped[$trackableId][] = $this->toActivityProjection($row);
-        }
-
-        return $grouped;
-    }
-
-    /**
-     * Builds and prepares an activity read, joined to the author, in the list's
-     * own order.
-     *
-     * The `WHERE` body is supplied by the caller because the two readers differ
-     * only there: one narrows on the company's own trackable type and id, the
-     * other on a set of deal ids. Everything else — the projection, the join and
-     * the order — is shared, so the two cannot drift apart.
-     *
-     * The tables are aliased (`a`, `u`) rather than qualified by their real names.
-     * A qualifier has to name the table as the statement wrote it, and this
-     * statement writes `` `wp_activities` ``; MySQL creates no alias from the
-     * prefix, so `` `activities`.`id` `` after `` FROM `wp_activities` `` is error
-     * 1054, "Unknown column 'activities.id'". An explicit alias is the spelling
-     * that resolves, and it keeps the prefix in the `FROM` clause alone.
-     *
-     * @param string $where A clause body with `%s`/`%d` placeholders, qualifying columns as `a.`.
-     * @param list<mixed> $args Values for those placeholders, in order.
-     *
-     * @return string A prepared statement.
-     */
-    private function activityQuery(string $where, array $args): string
-    {
-        $activities = $this->column(self::ACTIVITIES_TABLE);
-        $users = $this->column(self::USERS_TABLE);
-
-        return $this->prepare(
-            sprintf(
-                'SELECT %s, %s, %s, %s, %s, %s, %s, %s AS `user_name` '
-                . 'FROM %s LEFT JOIN %s ON %s = %s '
-                . '%s ORDER BY %s DESC, %s DESC',
-                "{$activities}.`id`",
-                "{$activities}.`type`",
-                "{$activities}.`subject`",
-                "{$activities}.`description`",
-                "{$activities}.`due_date`",
-                "{$activities}.`completed_at`",
-                "{$activities}.`trackable_id`",
-                "{$users}.`display_name`",
-                $this->tableName(self::ACTIVITIES_TABLE),
-                $this->tableName(self::USERS_TABLE),
-                "{$users}.`ID`",
-                "{$activities}.`user_id`",
-                $where,
-                "{$activities}.`created_at`",
-                "{$activities}.`id`"
-            ),
-            $args
         );
     }
 
@@ -485,51 +191,6 @@ final class WpCompanyReadRepository extends BaseReadRepository implements Compan
             address: $this->toNullableString($row['address'] ?? null),
             createdAt: $this->toNullableString($row['created_at'] ?? null),
             updatedAt: $this->toNullableString($row['updated_at'] ?? null),
-        );
-    }
-
-    /**
-     * Builds the stage read model from a joined deal row, or null when the
-     * joined stage is absent.
-     *
-     * @param array<string, mixed> $row
-     *
-     * @return CompanyDealStageProjectionDTO|null
-     */
-    private function toStageProjection(array $row): ?CompanyDealStageProjectionDTO
-    {
-        // A LEFT JOIN yields NULL in every stage column when there is no stage.
-        // `stage_id` is the one never null on a real row, so its absence decides.
-        if (($row['stage_id'] ?? null) === null) {
-            return null;
-        }
-
-        return new CompanyDealStageProjectionDTO(
-            id: (int) $row['stage_id'],
-            name: (string) $row['stage_name'],
-            orderPosition: (int) $row['stage_order_position'],
-            probability: (int) $row['stage_probability'],
-        );
-    }
-
-    /**
-     * @param array<string, mixed> $row
-     *
-     * @return CompanyActivityProjectionDTO
-     */
-    private function toActivityProjection(array $row): CompanyActivityProjectionDTO
-    {
-        return new CompanyActivityProjectionDTO(
-            id: (int) $row['id'],
-            type: (string) $row['type'],
-            subject: (string) $row['subject'],
-            description: $this->toNullableString($row['description'] ?? null),
-            dueDate: $this->toNullableString($row['due_date'] ?? null),
-            completedAt: $this->toNullableString($row['completed_at'] ?? null),
-            // The LEFT JOIN yields NULL for a deleted author; the alias is
-            // absent from the row only if the driver dropped it, so the null
-            // coalesce covers that rather than reading an undefined key.
-            userName: $this->toNullableString($row['user_name'] ?? null),
         );
     }
 
@@ -572,8 +233,8 @@ final class WpCompanyReadRepository extends BaseReadRepository implements Compan
      * return value, then builds its result from `last_result`, which `flush()` has
      * already set to `array()` (see `wp-includes/class-wpdb.php`, `get_results()`
      * and `flush()`). So a `=== false` test never fires in production, and every
-     * broken multi-row read would be reported as "this company has no contacts" —
-     * a fault rendered as an ordinary empty result.
+     * broken multi-row read would be reported as an ordinary empty result —
+     * a fault rendered as absence.
      *
      * The failure is read from `last_error` instead, which `flush()` clears at the
      * start of each statement and the driver sets on error. This is the same test
@@ -654,27 +315,6 @@ final class WpCompanyReadRepository extends BaseReadRepository implements Compan
         }
 
         return $prepared;
-    }
-
-    /**
-     * A table name, backtick-quoted, for use as a column qualifier.
-     *
-     * A qualifier has to name the table the way the statement's own `FROM`/`JOIN`
-     * spelled it. Those clauses write the **prefixed** name, and MySQL creates no
-     * alias from the prefix — so `` `deals`.`id` `` after `` FROM `wp_deals` `` is
-     * error 1054, "Unknown column 'deals.id'", even though the table is right
-     * there. The prefixed spelling is the one that resolves.
-     *
-     * The prefix is the site's own configured value, not request input, and it is
-     * backtick-escaped here like every other identifier.
-     *
-     * @param string $table The table name, without the WordPress prefix.
-     *
-     * @return string
-     */
-    private function column(string $table): string
-    {
-        return '`' . $this->escapeIdentifier($this->tableName($table)) . '`';
     }
 
     /**

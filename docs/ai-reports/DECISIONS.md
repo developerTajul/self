@@ -1,1090 +1,717 @@
 # Decisions
 
 Decisions taken while executing a plan that AGENTS.md and the rule files did not
-cover. Each records what was decided, why, and the proposed AGENTS.md change.
+cover. Each records what was decided, why (basis), its impact, and the proposed
+AGENTS.md change.
+
+> **Fresh trail (2026-11-23).** The previous `DECISIONS.md` (format `D-2026-11-14-NN`,
+> last ID `D-2026`-series, 1090 lines — still in commit `065ab4e`) was purged from the
+> working tree with the rest of `docs/ai-reports/` before this plan started. On the
+> developer's instruction the trail **restarts at `D-001`**; no ID from the previous file
+> is reused. Sections A–C below transcribe the approved decisions of
+> `docs/ai-plans/lead-module-action-plan.md` (Step 0.1's mandate); section D records the
+> gaps this audit found.
 
 ---
 
-## D-2026-11-14-01 — `companies.name` is unique (business rule, new)
+## A. Plan decisions — developer-approved (transcribed, Step 0.1)
 
-**Decided:** `companies.name` carries a UNIQUE index. Two companies may not share
-a name. Landed as `database/migrations/2026_10_31_222317_make_companies_name_unique.php`.
+| ID | Ref | Status | Decision | Basis |
+| --- | --- | --- | --- | --- |
+| D-001 | A1 | DECIDED | `LeadStatus` = `new`, `contacted`, `qualified`, `converted`, `lost`. `LeadSource` = `contact_form_7`, `woocommerce`, `hubspot`, `manual`. `SyncEventStatus` = `pending`, `processing`, `succeeded`, `dead`. | plan §2 A1; developer-confirmed |
+| D-002 | A2 | DECIDED | `LeadEntity::capture()` requires at least one of `email` or `phone`; neither → domain exception. | plan §2 A2 |
+| D-003 | A3 | DECIDED | Additive Shared port `UuidGeneratorContract` (`core/Shared/Domain/Contracts`) + adapter `WpUuidGenerator` (`wp_generate_uuid4()`), bound once in `AppServiceProvider`; the Entity receives the uuid as a parameter. | plan §2 A3 |
+| D-004 | A4 | DECIDED | On a merge-mapping conflict the primary lead's mapping stays; the secondary's conflicting mapping is deleted and the removal logged. | plan §2 A4 |
+| D-005 | A5 | DECIDED | `sync_events` has no lead column; the lead reference travels in `payload_json` (`entity_type`, `local_entity_id`). | plan §2 A5 |
+| D-006 | A6 | DECIDED | `dead_letters.job_class` values are the Domain constants `SyncEventEntity::HANDLER_OUTBOUND` / `HANDLER_INBOUND`. | plan §2 A6 |
+| D-007 | A7 | DECIDED | Inbound webhooks: the controller verifies signature + idempotency, enqueues a `sync_events` row (direction `inbound`) and returns `200` fast; the worker does the rest. | plan §2 A7 |
 
-**Why:** `CompanyDuplicateException` and the write repository's duplicate
-translation already existed, but `companies.name` was declared `->index()` when
-the table was created, so nothing enforced uniqueness — the conflict path was
-detection with no constraint behind it. The developer confirmed the constraint
-should be live.
+## B. Plan decisions — proposals, all confirmed by the developer (transcribed, Step 0.1)
 
-**Consequences the developer accepted:**
+| ID | Ref | Status | Decision | Basis |
+| --- | --- | --- | --- | --- |
+| D-008 | DP-1 | DECIDED | `Lead` owns port `LeadCaptureOutboxContract`; adapter in `core/CrmSync/Infrastructure` writes `sync_events` in the SAME transaction (transactional outbox). | plan §2 DP-1; developer-confirmed |
+| D-009 | DP-2 | DECIDED | `Lead` owns port `LeadMappingRelinkContract`; adapter in `core/CrmSync/Infrastructure`. | plan §2 DP-2 |
+| D-010 | DP-3 | DECIDED | The DB outbox is the durable queue; Action Scheduler / WP-Cron only TRIGGER worker + reaper. No second job system (`QueueManagerContract` unused). | plan §2 DP-3 |
+| D-011 | DP-5 | DECIDED | Webhook authenticity verified in DELIVERY before any Service runs (raw body + headers, constant-time compare, timestamp window). | plan §2 DP-5 |
+| D-012 | DP-6 | DECIDED | Idempotency key = `sha256(source + ':' + external id)` = 64 hex chars; never derived from mutable lead fields. | plan §2 DP-6 |
+| D-013 | DP-7 | DECIDED | The Entity accepts backoff jitter seconds as a parameter. | plan §2 DP-7 |
+| D-014 | DP-8 | DECIDED | First release scope: HubSpot adapter + CF7 + WooCommerce only. | plan §2 DP-8 |
+| D-015 | DP-9 | DECIDED | `SyncDirection` = `outbound`, `inbound`. `CrmProviderName` = `hubspot`. `LocalEntityType` = `lead`, `order`. `CrmObjectType` = `contact`, `deal`. | plan §2 DP-9 |
+| D-016 | DP-4 | DECIDED | No `LeadSnapshotContract`: `sync_events.payload_json` is a NOT NULL snapshot (resolved by the schema). | plan §2 (DP-4 note) |
 
-- Applying it **refuses an install that already holds duplicate names.** The
-  statement fails; duplicates are not removed, because deleting customer rows is
-  not a migration's decision to make.
-- The comparison follows the column's collation (`utf8mb4_unicode_ci`), so `Acme`
-  and `acme` collide. This matches P5 (natural keys, case-insensitive).
-- A submission that previously succeeded can now be rejected.
+## C. Schema facts and derived rules the plan depends on (verified against `database/migrations`, Step 0.1)
 
-**Not covered by any existing rule.** Rules 05/06 govern ports and entities; P5
-covers matching seeded rows by natural key, not *declaring* one. A uniqueness rule
-enforced by a database index belongs in the schema, and this is the first such
-rule in this project that is not a technical constraint (foreign keys, join
-tables).
+All four migrations were read and match plan §3. Status is `VERIFIED` (fact confirmed on disk), not `OPEN`.
 
-**Proposed AGENTS.md change:** add to PROJECT CONVENTIONS, after P5:
+| ID | Ref | Status | Fact / derived rule | Evidence |
+| --- | --- | --- | --- | --- |
+| D-017 | S1 | VERIFIED | The retry ceiling is a Domain constant (`SyncRetryRules::MAX_ATTEMPTS`), kept far below 255 so reaper increments cannot overflow the smallint column. | `database/migrations/2026_11_22_210100_create_sync_events_table.php:42` (`unsignedTinyInteger('attempts')`) |
+| D-018 | S2 | VERIFIED | `CrmMappingEntity` carries `entityType`, `localEntityId`, `provider`, `crmObjectType`, `RemoteId`; remote lookups use the three-part key. | `..._create_crm_mappings_table.php:42-49` (both UNIQUE indexes) |
+| D-019 | S3 | VERIFIED | Inbound events are written to `sync_events` (direction `inbound`) by the webhook step. | `..._create_sync_events_table.php:37` (`direction`) |
+| D-020 | S4 | VERIFIED | The DLQ keeps the FULL `payload_json`; only `error_message` is scrubbed. A dead letter replays ONCE (`retried_at` set → second replay rejected). | `..._create_dead_letters_table.php:43-47` |
+| D-021 | S5 | VERIFIED | Merge order respects both UNIQUE indexes: lock both leads ascending by id, delete the secondary FIRST, then fill the primary's blanks; a duplicate-key failure on concurrent capture is retried once. | `database/migrations/2026_09_29_232811_create_leads_table.php:43-46`; `..._create_crm_mappings_table.php:42-49` |
+| D-022 | S6 | VERIFIED / FAILED-IN-PART | `assigned_to` references `users` and `dead_letters` FKs reference `sync_events`. Table prefix and FK-target resolution verified; the claimed `ENGINE=InnoDB` emission is **not implemented** — see D-026. | `leads` migration:53-56; `dead_letters` migration:32-40; see D-026 |
+| D-023 | S7 | VERIFIED | `LeadEntity` holds `array $meta`; the EntityMapper encodes/decodes `meta_json`; invalid stored JSON raises a mapper `\RuntimeException`, never a silent empty array. | `leads` migration:51 (`longText('meta_json')->nullable()`) |
 
-> **P17 NATURAL-KEY UNIQUENESS IS A SCHEMA CONSTRAINT:** a business rule stating
-> that a value identifies one row (a company name, an account email) is enforced
-> by a UNIQUE index, not only by an application check. The adapter translates the
-> rejection into the module's conflict exception; the Service catches that and
-> returns a failure Result. A rule enforced only in application code races between
-> two concurrent writers.
+## D. Gaps found by the Step 0.1 audit (A9 Tier 2/3)
 
----
+## D-024 — `ClockContract` does not exist, but the plan's guardrails require it
 
-## D-2026-11-14-02 — the `$wpdb` duplicate check matches message text
+**Type:** GAP (plan assumes an artifact that is absent) · **Step:** 0.1 · **Status:** DECIDED (2026-11-23, developer-approved)
 
-**Decided:** `BaseRepository::throwIfDuplicate()` recognises a rejected unique key
-by testing `$wpdb->last_error` for the SQLSTATE `23000` or MySQL's
-`Duplicate entry` phrase, rather than by an error number.
+**Situation.** The plan's guardrail (plan §6) says "Time comes from `ClockContract` in Core and the base repository's UTC `now()` in Infrastructure". Step 1.2 requires `LeadEntity` behaviour methods to receive `$now`, and Step 3.1's flow needs a `DateTimeImmutable` inside the Service. No `ClockContract` exists anywhere: `core/Shared/Domain/Contracts/` holds only `CacheInterface`, `EventDispatcherContract`, `FileUploaderContract`, `PasswordHasherContract`, `RateLimiterContract`, `SlugCheckerContract`, `TokenGeneratorContract`, `TransactionManagerContract`, `TranslatorContract` (repo-wide grep for `ClockContract` → 0 hits).
 
-**Why:** `$wpdb` exposes no error code. WordPress reads `mysqli_errno()` into a
-local variable for its own reconnect logic (`wp-includes/class-wpdb.php:2270-2273`)
-and never stores it on the object. Verified in the WordPress source rather than
-assumed. `last_error` is the only channel available.
+**Options considered.**
+1. Add an additive Shared port `ClockContract` + a `WpClock` adapter (mirrors A3's treatment of `UuidGeneratorContract`), bound in `AppServiceProvider`.
+2. Have the Delivery layer construct `new \DateTimeImmutable('now', new \DateTimeZone('UTC'))` and pass it through the DTO (P14-style: delivery resolves ambient state and passes it in).
+3. Have the base repository's `now()` (`BaseWriteRepository.php:313`, UTC string) be the only time source, with the Service re-parsing the string.
 
-**Trade-off accepted:** the Fluent builder's path (`WpFluentQueryBuilder`) uses
-error **1062**, which is exact; this path matches text, which is localised and
-reworded between MySQL versions. The check is confined to one method so the
-weakness has one home.
+**Decision (developer-approved 2026-11-23).** Option 1 — additive `ClockContract` (`now(): DateTimeImmutable`) in `core/Shared/Domain/Contracts/` + UTC `WpClock` in `core/Shared/Infrastructure/Utilities/`, bound once in `AppServiceProvider` alongside `UuidGeneratorContract`. Implemented in Step 0.2.
 
-**Proposed AGENTS.md change:** note under D7 that `$wpdb` repositories detect
-duplicates from `last_error`, since no error code is exposed, and that this is the
-one sanctioned exception to "never match on driver message text".
+**Basis.** plan §6 guardrail; AGENTS A4 ("additive Shared kernel additions (new Contract + adapter)"); plan §2 A3 (same shape).
 
----
-
-## D-2026-11-14-03 — a shared `BaseRepository` may not demand a connection
-
-**Decided:** `BaseRepository::__construct()` takes `?wpdb $wpdb = null` and
-resolves the global lazily, rather than requiring a handle.
-
-**Why:** the container builds every repository during a provider's `register()`,
-which runs before WordPress has loaded `$wpdb`. A required handle would make every
-repository unbuildable at that point. This follows the pattern
-`LeadWriteRepository` and `LeadNoteWriteRepository` already establish.
-
-**Proposed AGENTS.md change:** none. This is an application of the existing
-"Reading `framework/` … is always allowed" plus the DI mandate; it is recorded here
-only because it is the reason the shared base changed shape.
-
----
-
-## D-2026-11-14-04 — five `BaseRepository` subclasses are knowingly left broken
-
-**Decided:** `ActivityWriteRepository`, `AuthWriteRepository`,
-`ContactWriteRepository`, `DealWriteRepository` and `PipelineWriteRepository` were
-not updated for the new base constructor, so they cannot be constructed.
-
-**Why:** the plan names three Company files and no others, and AGENTS.md's STRICT
-SCOPE ADHERENCE forbids refactoring code the prompt did not name. All five were
-**already** dead: they extend `BaseRepository` with `parent::__construct($model)`
-against Eloquent models, `app/Models/` does not exist, and two import
-`Illuminate\Database\QueryException` / `Illuminate\Support\Facades\DB`.
-
-**Consequence:** this is a real, separate JOB C task, not a completed refactoring.
-It is recorded here so it is not mistaken for done.
-
-**Proposed AGENTS.md change:** none. This is a scope decision, not an architectural
-one.
-
----
-
-## D-2026-11-15-01 — the five dead adapters are re-pointed but not repaired
-
-**Step:** `core/01-repository-split-refactor`.
-**Type:** RULE CONFLICT (brief vs. A10/H2).
-
-**Situation:** the brief instructs "fix the 5 dead adapters" by removing the Eloquent model
-from their constructors and aligning them with the `$wpdb` pattern. They are not
-constructor-broken. Their bodies are Eloquent calls — `fill()`, `save()`, `toArray()`,
-`refresh()`, `getAttributes()`, `DB::transaction()`, pivot `syncWithoutDetaching()` — and
-both `app/Models/` and `vendor/illuminate/` do not exist in this plugin. Removing the
-constructor argument leaves five classes that still reference five unresolvable model
-classes and an uninstalled package. `ContactWriteRepository` alone has 17 Eloquent call
-sites, plus pivot read/write and transaction semantics to rebuild by hand.
-
-**Options considered:** (a) rewrite all five as `$wpdb` adapters; (b) re-point the
-inheritance only and leave the bodies dead; (c) delete them as unreferenced dead code;
-(d) leave them entirely untouched.
-
-**Decision:** (b), after the developer chose "skip them, ship the rest" when the conflict
-was raised. Their `extends` and `use` name `BaseWriteRepository` so the rename leaves no
-dangling reference — without that, deleting `BaseRepository` would have moved their failure
-from first-construct to class-load, widening it. Bodies unchanged.
-
-**Basis:** A9 precedence 1 (the developer's explicit instruction in the current brief, within
-scope) over A10-H2; §6 SCOPE forbids inventing five query implementations the brief never
-described.
-
-**Impact:** five files, two lines each; fully reversible. No runtime change — nothing binds
-any of the five.
-
-**Proposed AGENTS.md change:** none. This is a scope decision, not an architectural one.
-
-**Status:** OPEN — the real repair is a separate JOB C task, one module at a time.
-
----
-
-## D-2026-11-15-02 — `AbstractWpRepository` replaces `BaseRepository` as the D4 base
-
-**Step:** `core/01-repository-split-refactor`.
-**Type:** RULE CONFLICT (§4 D4 vs. the brief).
-
-**Situation:** §4 D4 read "the abstract base stays `BaseRepository`". The brief renames that
-class and installs `AbstractWpRepository` as the root of a three-class hierarchy.
-
-**Options considered:** keep D4 and decline the rename; or follow the brief and rewrite D4.
-
-**Decision:** followed the brief. D4 rewritten to name `AbstractWpRepository` as the root,
-extended by `BaseWriteRepository` and `BaseReadRepository`.
-
-**Basis:** A9 precedence 1 — the brief names this change explicitly. A16's "no rule file,
-AGENTS.md, skill or plan edited" is overridden by the brief authorising exactly these files.
-
-**Impact:** `AGENTS.md` §4, §9, §14 and `03`/`04`/`06`; reversible.
-
-**Proposed AGENTS.md change:** none beyond the edit itself; the developer should confirm the
-new D4 wording.
-
-**Status:** OPEN.
-
----
-
-## D-2026-11-15-03 — `$table` is a per-call argument, not a constructor property
-
-**Step:** `core/01-repository-split-refactor`.
-**Type:** GAP.
-
-**Situation:** the brief's new method signatures take `string $table` per call. The old `03`
-rule described a base whose constructor took `$table` once and held it as
-`protected readonly string $table` — an API the real `BaseRepository` never had.
-
-**Decision:** kept the brief's per-call shape, which is what the live code already did
-(`$this->insert($values, self::TABLE_SUFFIX, $action)`), and rewrote the `03` BASE REPOSITORIES
-section to describe the three classes as they actually are, including the ctor taking only
-`?wpdb $wpdb = null`.
-
-**Basis:** A9 precedence 5 (existing codebase convention, verified by reading) plus the brief.
-
-**Impact:** `03` only. Reversible.
+**Impact (files, reversibility).** Step 0.2 would also create `core/Shared/Domain/Contracts/ClockContract.php` + `core/Shared/Infrastructure/Utilities/WpClock.php` and bind it in `AppServiceProvider`. Reversible; additive only.
 
 **Proposed AGENTS.md change:** none.
 
-**Status:** OPEN.
+## D-025 — `DuplicateKeyException` and `WpQueryExceptionTranslator` are named by AGENTS/plan but do not exist
+
+**Type:** RULE ERROR (rule text names an artifact the codebase does not have) · **Step:** 0.1 · **Status:** DECIDED (2026-11-23, developer-approved)
+
+**Situation.** AGENTS §11 says "Infrastructure translates a duplicate-key failure to `Core\Shared\Domain\Exceptions\DuplicateKeyException` (or the module's conflict exception)". The plan's Phase 2 preamble says "duplicate key only via `WpQueryExceptionTranslator`". Neither exists (repo-wide greps → 0 hits). The actual mechanism is the module-owned exception plus one shared hook: `BaseWriteRepository::duplicateException()` (`core/Shared/Infrastructure/Repositories/BaseWriteRepository.php:77`) returns the failure unchanged by default, and `throwIfDuplicate()` (`:408`) detects an integrity violation from `$wpdb->last_error`; each module overrides `duplicateException()` to name its own exception (e.g. `core/Company/Domain/Exceptions/CompanyDuplicateException.php`). `core/Shared/Exceptions/DomainValidationException.php:5` also sits in namespace `Core\Shared\Exceptions`, not the `Core\Shared\Domain\Exceptions` path AGENTS §11 spells.
+
+**Options considered.** (1) Treat the module conflict exception as the sanctioned mechanism (the rule's own parenthetical) and have the Lead/CrmSync write repositories override `duplicateException()` with `LeadDuplicateException` / `SyncEventDuplicateException`. (2) Add an additive Shared `DuplicateKeyException` and a translator adapter.
+
+**Decision (developer-approved 2026-11-23).** Option 1 — the existing `BaseWriteRepository::duplicateException()` mechanism throws module-specific conflict exceptions; **no global translator class is added**. The Lead module supplies its exception when the write repository lands (Step 2.1); the plan preamble's `WpQueryExceptionTranslator` and AGENTS §11's `DuplicateKeyException` remain stale text (proposed correction below).
+
+**Basis.** AGENTS §11 parenthetical; `BaseWriteRepository.php:77,408`; plan §5 Step 2.1.
+
+**Impact (files, reversibility).** No code change required to proceed; the module exception names are chosen in Steps 2.1/2.3. Reversible.
+
+**Proposed AGENTS.md change:** in §11, replace "translates a duplicate-key failure to `Core\Shared\Domain\Exceptions\DuplicateKeyException` (or the module's conflict exception)" with "translates a duplicate-key failure to the module's conflict exception by overriding `BaseWriteRepository::duplicateException()`" and note the `Core\Shared\Exceptions` path for `DomainValidationException`.
+
+## D-026 — the Schema builder does not emit `ENGINE=InnoDB`, though rule 02 and the plan's S6 require it
+
+**Type:** RULE ERROR / plan-premise failure · **Step:** 0.1 · **Status:** DECIDED (2026-11-23, developer-confirmed)
+
+**Situation.** `.claude/rules/02-framework-adapter-wordpress.txt:64` states "Transactional tables are InnoDB (verify the Schema builder emits `ENGINE=InnoDB`; MyISAM silently ignores transactions and `FOR UPDATE`)". The plan's S6 depends on the same. **No code emits it**: `Blueprint::toCreateSql()` (`framework/Database/Schema/Blueprint.php:1892`) renders `CREATE TABLE \`%s\` (...)` and appends only the charset clause; `Schema::create()` (`framework/Database/Schema/Schema.php:214`) passes `$adapter->charsetCollation()`; `WpDatabaseAdapter::charsetCollation()` (`framework/Database/Adapters/WpDatabaseAdapter.php:428`) returns `$wpdb->get_charset_collate()` (charset/collate only), and `createTable()` (`:215`) hands the statement to `dbDelta()` unchanged. A repo-wide search for `ENGINE=` outside `vendor/` finds no emitted clause. Conversely, README.md:2770 ("The schema builder emits InnoDB, so the engine half is satisfied by default") and `framework/Database/Query/QueryBuilderInterface.php:345` assert the emit — documentation that contradicts the code.
+
+**Why it is not treated as a hard stop here.** The plan's requirement is InnoDB *semantics* (row locks in Step 2.2's reaper, `findByIdForUpdate`, transactional outbox/DLQ), and a table created without an engine clause inherits the server's `default_storage_engine`, which is InnoDB on every supported MySQL (5.5+) and MariaDB (10.2+). So the plan can be completed without a framework change; the missing clause is a robustness/portability gap plus a doc error, and its remedy is a `framework/` change (JOB F), which is out of this step's scope (`framework/` is never in a module step, H12).
+
+**Options considered.** (1) Accept the server default and correct the two documents that claim an emit. (2) Have a JOB F task make `toCreateSql()`/the adapter emit `ENGINE=InnoDB` (framework change; separate task). (3) Declare the engine in a migration — **rejected**: the plan forbids creating or editing migrations, and it is the wrong layer for a framework-wide property.
+
+**Decision (developer-confirmed 2026-11-23).** Option 1 — **the database storage engine is InnoDB**, verified by the developer from successful foreign-key creation across all four tables (`leads`, `crm_mappings`, `sync_events`, `dead_letters`). **No framework change is made**: the missing explicit `ENGINE=InnoDB` clause stays as-is, and the two documents that claim the builder emits it (`README.md:2770`, `framework/Database/Query/QueryBuilderInterface.php:345`) remain stale text (a JOB F documentation task, if the developer wants it).
+
+**Basis.** `.claude/rules/02-framework-adapter-wordpress.txt:64`; plan §3 S6; AGENTS §6 (HALT only when a framework change is *needed*).
+
+**Impact (files, reversibility).** No file changes now. Option 2, if chosen, touches `framework/Database/Schema/Blueprint.php` (JOB F). Reversible.
+
+**Proposed AGENTS.md change:** none for option 1; for option 2, none (already mandated by rule 02:64).
+
+## D-027 — documentation drift: `SlugGeneratorContract`, "empty" `BaseReadRepository`, and the `WpTransactionManager` location
+
+**Type:** RULE ERROR (docs describe a different codebase than the one on disk) · **Step:** 0.1 · **Status:** DECIDED (2026-11-23, developer-approved)
+
+**Situation.** Three smaller drifts, none affecting this plan's steps. (a) The plan's Step 0.1 checklist names `SlugGeneratorContract`; the port is actually `SlugCheckerContract` (`core/Shared/Domain/Contracts/SlugCheckerContract.php:11`) and `SlugGenerator` is a concrete class (`core/Shared/Infrastructure/Utilities/SlugGenerator.php:18`), not a contract. The plan marks this "not needed here, report only". (b) AGENTS D4 calls `BaseReadRepository` "currently empty, ready for shared read helpers"; it actually ships `findRecordById()` (`core/Shared/Infrastructure/Repositories/BaseReadRepository.php:33`) and `rowExists()` (`:62`). (c) AGENTS §10 places `WpTransactionManager` in `core/Shared/Infrastructure/Database/`; it lives at `app/Database/WpTransactionManager.php:22` (as does `app/Cache/WpCacheStore.php` and `app/Database/AtomicDatabaseRateLimiter.php`), which also rubs against AGENTS §1's "Adapters never live in `app/`".
+
+**Options considered.** (1) Report and leave the code as-is (no plan step depends on these). (2) Correct the AGENTS.md/plan wording in a later documentation step.
+
+**Decision (developer-approved 2026-11-23).** Follow the **actual codebase** names and paths — `TranslatorContract::translate()` (not `get()`), `WpTransactionManager` in `app/Database/`, the real `BaseReadRepository` helpers. No code is moved now; the documentation corrections are **logged for Step 5.3** (final audit and module summaries), which is where doc/rule drift is reported.
+
+**Basis.** AGENTS D4, §10, §1; files cited above.
+
+**Impact (files, reversibility).** None on this plan. Reversible.
+
+**Proposed AGENTS.md change:** D4 — drop ", currently empty, ready for shared read helpers"; §10 — restate literally that `WpTransactionManager` lives at `app/Database/WpTransactionManager.php` until a later move, or move the file to `core/Shared/Infrastructure/Database/` under a JOB C/refactor task. (The move is a code change, so it is proposed here, not made.)
 
 ---
 
-## D-2026-11-15-04 — four rule files still name the deleted `BaseRepository`
+## E. Gaps found by the Step 0.2 audit (lead module scaffold)
 
-**Step:** `core/01-repository-split-refactor`.
-**Type:** RULE ERROR.
+## D-028 — how much of `core/Lead/` is "fully implemented" at scaffold time
 
-**Situation:** `02-framework-adapter-wordpress.txt` (lines 27, 41, 63, 65, 77),
-`05-rich-domain-and-services.txt` (lines 136, 139), `09-autonomous_execution.txt` (C13) and
-`11-fluent-database.txt` (lines 2, 8, 12) still reference `BaseRepository`, which this step
-deleted.
+**Type:** RULE CONFLICT (plan 0.2 vs rule 03 / module-scaffolder skill) · **Step:** 0.2 · **Status:** DECIDED
 
-**Options considered:** edit them now; or record and defer.
+**Situation.** Rule 03's FULL-BASELINE MANDATE and the `module-scaffolder` skill say the EntityMapper and the ResponseDTO/ResponseMapper are fully implemented mechanical mappings at scaffold time, and that YAGNI never trims the baseline. Step 0.2 says the opposite: "the full `core/Lead/` tree of section 4 as **empty skeletons with `// TODO:`**", with a separate "**FULLY IMPLEMENTED (mechanical)**" list naming only `LeadEntity` and the two enums, and `OUT OF SCOPE: … DTOs, request mapper methods, service methods`.
 
-**Decision:** **not edited.** The brief named exactly four files (`AGENTS.md`, `03`, `04`,
-`06`); A2.5 forbids editing rule files the brief did not name. Recorded here so the next
-brief fixes them.
+**Options considered.** (1) Follow rule 03 (implement EntityMapper/ResponseDTO/ResponseMapper now). (2) Follow the brief (skeletons only; the use-case steps implement them).
 
-**Basis:** A2.5 and §6 SCOPE.
+**Decision.** Option 2 — the brief wins (`09` A9 precedence 1: the developer's explicit instruction in the current brief; the skil is precedence 4). Only `LeadEntity`, `LeadStatus`, `LeadSource` and the Shared uuid/clock/dispatcher artifacts are fully implemented; `LeadEntityMapper`, `LeadResponseMapper` and both DTOs are skeletons whose declared methods throw `\LogicException` with a `// TODO:`. Steps 2.1 and 3.1 implement them.
 
-**Impact:** those four rule files now contain a dangling class name. This is the **one known
-inconsistency left by the step**, and the reason its status is DONE_WITH_NOTES.
+**Basis.** plan §5 Step 0.2 (CREATE + FULLY IMPLEMENTED + OUT OF SCOPE); 09 A9 precedence 1 (brief) over 4 (skill); rule 03 §7.1.1 (contradicted).
 
-**Proposed AGENTS.md change:** none — the fix belongs in a follow-up brief that names those
-four files.
+**Impact (files, reversibility).** Declared-but-throwing mapper methods; trivially reversible. Stepping 2.1/3.1 replace the bodies.
 
-**Status:** OPEN — needs a follow-up step.
+**Proposed AGENTS.md change:** none (the conflict is plan-vs-rule; the plan is authoritative for its own steps).
 
----
+## D-029 — the request DTO, request mapper and `LeadMapperContract` are created at scaffold time
 
-## D-2026-11-15-05 — the cleanup brief's file names are paraphrases
+**Type:** RULE CONFLICT (plan 0.2 vs rule 03's just-in-time separation) · **Step:** 0.2 · **Status:** DECIDED
 
-**Step:** `core/02-repository-rules-cleanup`.
-**Type:** AMBIGUOUS BRIEF.
+**Situation.** Rule 03 says "Do NOT generate Request DTOs (CreateDTO, UpdateDTO), the Request Mapper (`{ModuleName}Mapper`), or `{ModuleName}MapperContract`. They are built later with their matching features." Step 0.2 nevertheless names `LeadMapperContract` among the contracts bound in `LeadServiceProvider`, and `LeadCaptureDTO`/`LeadMapper` appear in plan §4's final tree.
 
-**Situation:** the brief names `02-framework-adapter-wp.txt`, `05-error-handling.txt` and
-`11-test-strategy.txt`. None of those files exists. The real files are
-`02-framework-adapter-wordpress.txt`, `05-rich-domain-and-services.txt` and
-`11-fluent-database.txt`.
+**Options considered.** (1) Create the three as TODO-only skeletons. (2) Skip them; bind only the four module ports + response mapper; implement in Step 3.1.
 
-**Options considered:** halt for confirmation; or resolve from the hit counts.
+**Decision.** Option 1 — the three files exist as skeletons (`LeadCaptureDTO` has no properties; `LeadMapper` implements the empty `LeadMapperContract` and holds nothing), so §4's tree is complete and the step's ACCEPTANCE ("… + `LeadMapperContract` bound once in `LeadServiceProvider`") is met. Their content lands in Step 3.1.
 
-**Decision:** resolved without halting. Each of the brief's estimates (5, 2, 3) matched exactly
-one real file's `BaseRepository` count, and `09-autonomous_execution.txt` with "specifically
-C13" named its target precisely.
+**Basis.** plan §5 Step 0.2 CREATE + ACCEPTANCE; rule 03 §7.1.1 (contradicted).
 
-**Basis:** 09 A2.2 (a minor ambiguity never halts; take the safest standard path and record it)
-and A3 (merely unclear = AMBIGUOUS BRIEF, not H7).
+**Impact (files, reversibility).** Three extra skeleton files; no behaviour claimed. Reversible.
 
-**Impact:** none on the result; the correct four files were edited.
+**Proposed AGENTS.md change:** in rule 03 §7.1.1, note that a plan step may explicitly request the Request DTO/Mapper/MapperContract at scaffold time, in which case they are created as empty skeletons and filled by their CRUD step.
+
+## D-030 — Lead Command Service constructor composition at scaffold time
+
+**Type:** GAP (the brief does not fix the ctor) · **Step:** 0.2 · **Status:** DECIDED
+
+**Situation.** Rule 03 gives a Command Service ctor template (repository contract, response mapper, `TransactionManagerContract`, `EventDispatcherContract`, logger, plus schema-implied ports). The plan needs more (uuid, clock) and less (no queued work).
+
+**Decision.** `LeadCommandService` injects, in order: `LeadRepositoryContract`, `LeadResponseMapper` (concrete — plan §4 declares no `LeadResponseMapperContract`), `TransactionManagerContract`, `EventDispatcherContract`, `UuidGeneratorContract`, `ClockContract`, `TranslatorContract`, `LoggerInterface`. `LeadQueryService` injects `LeadQueryContract`, `LeadResponseMapper`, `LoggerInterface` only (rule 03 R12.6). **Not injected:** `QueueManagerContract` (no queued work) and the two cross-module ports `LeadCaptureOutboxContract` / `LeadMappingRelinkContract`, whose adapters do not exist until Step 0.3 — injecting a port nothing binds would leave `LeadCommandServiceContract` unresolvable. They are added to the ctor in Step 3.1.
+
+**Basis.** rule 03 §7.1.1 (ctor template, query-service restriction); AGENTS §11 ("create only the ports the task needs"); plan §2 A3, DP-1, DP-2.
+
+**Impact (files, reversibility).** A ctor edit in Step 3.1; no behaviour change. Reversible.
 
 **Proposed AGENTS.md change:** none.
 
-**Status:** OPEN.
+## D-031 — `WpEventDispatcher` is created and bound although this plan raises no events yet
+
+**Type:** RULE CONFLICT (rule 03's ctor template vs the plan's deferred events) · **Step:** 0.2 · **Status:** DECIDED
+
+**Situation.** Rule 03 states three times that the Command Service ctor injects `EventDispatcherContract` and that a newly injected Shared port's adapter must be created ("ADAPTER CO-GENERATION … generate it fully, without asking"), exempting `WpEventDispatcher` from the ordinary scope rule. The plan defers events: step 1.2 adds `$domainEvents`/`releaseEvents()` "only if a method raises an event", and `08`'s header says events/jobs are created only when a use case needs them. The live `CompanyCommandService` injects no dispatcher.
+
+**Options considered.** (1) Follow rule 03: inject the port, create `core/Shared/Infrastructure/Events/WpEventDispatcher.php`, bind it once. (2) Follow the live module and the plan: omit the port until an event exists.
+
+**Decision.** Option 1 — rule 03 is the brief's named governing rule and the adapter's behaviour is fully specified by rule 02 §2.3 and `08` E5 (`do_action('<prefix>_core_event', $event)` plus a per-class action), so nothing is invented. Bound as a singleton in `AppServiceProvider`, prefix from `config('app.prefix')`.
+
+**Basis.** rule 03 §7.1.1 + guardrail 3; rule 02 §2.3; `08` E5. Contradicted by `08`'s header and the live module.
+
+**Impact (files, reversibility).** One new Shared adapter + one binding; `LeadCommandService` carries an unused dependency until Step 3.1. Reversible (remove the ctor parameter and the binding).
+
+**Proposed AGENTS.md change:** in rule 03 §7.1.1, state whether the Command Service ctor carries `EventDispatcherContract` at scaffold time or only once a behaviour method raises an event — the two rules currently disagree.
+
+## D-032 — `LeadEntity` types its datetime columns as `?DateTimeImmutable`, not `?string`
+
+**Type:** GAP (rules vs the live module agree on nothing here) · **Step:** 0.2 · **Status:** DECIDED
+
+**Situation.** The live `CompanyEntity` types `createdAt`/`updatedAt` as `?string`. Rule 05 §5 says time is "PASSED IN (`DateTimeImmutable $now`)" and its Entity template types a datetime column `?DateTimeImmutable`; rule 02 §2.3:66 lists `DateTimeImmutable` among the explicit casts `toEntity()` must apply. Rule 03 line 2 says the Entity design follows AGENTS.md, "not older shapes".
+
+**Decision.** `?DateTimeImmutable $createdAt` / `?DateTimeImmutable $updatedAt` (UTC), following the rules. `LeadEntityMapper::toEntity()` (Step 2.1) parses `'Y-m-d H:i:s'` in UTC and `toPersistenceArray()` formats back — the same round trip `WpClock` supplies.
+
+**Basis.** rule 05 §5; rule 02 §2.3:66; rule 03 line 2 (contradicted by `core/Company/Domain/Entities/CompanyEntity.php`).
+
+**Impact (files, reversibility).** The Step 2.1 mapper must parse/format dates; a one-line type change to `?string` if the developer prefers the Company shape. Reversible.
+
+**Proposed AGENTS.md change:** state the datetime column type once, in rule 05 §5 (Entity) and rule 02 §2.3:66 (cast list), so modules stop diverging — and note whether existing `?string` modules are to be migrated.
+
+## D-033 — the clock adapter is named `WpClock`, not the rules' `SystemClock`
+
+**Type:** RULE CONFLICT (developer instruction vs rule 02's adapter table) · **Step:** 0.2 · **Status:** DECIDED
+
+**Situation.** Rule 02 §2.3's shared-adapter table names the `ClockContract` adapter **`SystemClock`** (UTC). The developer's D-024 instruction names it `WpClock` in `core/Shared/Infrastructure/Utilities/`.
+
+**Decision.** `WpClock` — the developer's explicit instruction wins (`09` A9 precedence 1).
+
+**Basis.** D-024 (developer-approved 2026-11-23); rule 02 §2.3 (contradicted).
+
+**Impact (files, reversibility).** A rename is a two-line change. Reversible.
+
+**Proposed AGENTS.md change:** rule 02 §2.3 — replace `SystemClock` with `WpClock` (or authorise either name), and add rows for the additive `UuidGeneratorContract` → `WpUuidGenerator` (A3), which the table does not list at all.
+
+## D-034 — T8 A's pattern flags Core port *declarations*, not only helper calls
+
+**Type:** RULE ERROR (a rule whose check cannot pass as written) · **Step:** 0.2 · **Status:** OPEN
+
+**Situation.** `06` T8 A run over the Core trees returned 3 matches, **none of them a helper call**:
+1. `core/Shared/Domain/Contracts/CacheInterface.php:46` — a docblock naming `wp_cache_get()` (pre-existing, untouched by this step).
+2. `core/Shared/Domain/Contracts/EventDispatcherContract.php:15` — `public function dispatch(object $event): void;` (pre-existing; the port AGENTS §11 mandates).
+3. `core/Shared/Domain/Contracts/ClockContract.php:22` — `public function now(): DateTimeImmutable;` (**new in this step**; the port rule 02 §2.3 mandates).
+
+T8 A's second pattern matches `(^|[^>:[:alnum:]_])now\(`, which a method **declaration** also satisfies, and its first pattern matches `wp_*` in prose. So the check cannot reach zero while Core declares the ports the rules require.
+
+**Options considered.** (1) Report the matches and keep the rule-prescribed names. (2) Rename `ClockContract::now()` (e.g. `current()`) to satisfy the regex, contradicting D-024 and rule 02 §2.3. (3) Propose a pattern refinement that excludes declarations (e.g. `(?<!function )(?<!->)now\(`).
+
+**Decision.** Option 1 **+** Option 3 as a proposal. The names stay as approved; the check's *intent* (Core Domain/Application free of framework and ambient helpers) holds — verified by T8 B (zero) and by reading every new Core file, none of which calls a framework function. The matches are reported raw in the step report.
+
+**Basis.** `06` T8 A + T10 ("T8 A/B zero matches") against `06`'s own FORBIDDEN list, which targets *calls*; `01` P6 ("Domain has zero framework imports"). Rule 06 is internally inconsistent here.
+
+**Impact (files, reversibility).** None on code; the DoD item "T8 A zero matches" cannot be marked green and is reported as such.
+
+**Proposed AGENTS.md change:** in `06` T8 A, anchor the helper alternatives so a declaration does not match — e.g. replace `now\(` with `(?<!function )\bnow\(` and require `wp_[a-z_]+\s*\(` to appear outside a comment, or document that port declarations are expected matches and are judged by reading.
 
 ---
 
-## D-2026-11-15-06 — six `BaseRepository` references remain in two skills
+## F. Gaps found by the Step 0.3 scaffold (CrmSync module)
 
-**Step:** `core/02-repository-rules-cleanup`.
-**Type:** RULE ERROR.
+## D-035 — the two cross-module adapters are created at scaffold time but carry no method
 
-**Situation:** the acceptance sweep for step 02 found `BaseRepository` in
-`.claude/skills/module-scaffolder/SKILL.md` (lines 40, 87) and
-`.claude/skills/update-action-builder/SKILL.md` (lines 70, 114, 139, 267). Line 87 instructs
-scaffolding "a `final class` extending `BaseRepository`" — a class deleted in step 01. Line 114
-tells the agent to verify `findRecordForUpdate()` exists in `BaseRepository` and to stop if it
-does not.
+**Type:** GAP (plan 0.3 says "skeletons implementing the Lead contracts", but those contracts are empty) · **Step:** 0.3 · **Status:** DECIDED
 
-**Options considered:** edit them now; or record and defer.
+**Situation.** Plan §5 Step 0.3: "`LeadCaptureOutboxAdapter` and `LeadMappingRelinkAdapter` are scaffolded as skeletons implementing the Lead contracts, bound in `CrmSyncServiceProvider`." But `LeadCaptureOutboxContract` and `LeadMappingRelinkContract` were created in Step 0.2 as **empty interfaces with a `// TODO:`** — plan §4 and D-029 defer every port method to Step 1.6. An adapter cannot implement a method that is not declared.
 
-**Decision:** **not edited.** The brief names four rule files and describes a "documentation and
-rule consistency pass" over those files; 09 A2.5 forbids editing skills the brief did not name.
+**Options considered.** (1) Create the two adapters now with constructor injection only, and declare their methods in Step 2.4 once Step 1.6 declares the ports. (2) Halt and ask the developer to move the port-method declaration forward into this step. (3) Skip the adapters until Step 2.4, leaving `CrmSyncServiceProvider` without the two bindings.
 
-**Basis:** 09 A2.5 and §6 SCOPE.
+**Decision.** Option 1. Both adapters exist at the plan's paths, implement their Lead contracts (vacuously — the interfaces are empty), carry constructor injection of the ports they will use, and are bound in `CrmSyncServiceProvider`. Step 0.3's ACCEPTANCE — the contracts are bound once — is met, and Step 1.6 → 2.4 fill the bodies without moving a file.
 
-**Impact:** a scaffolding skill would today instruct an agent to extend a deleted class. Both
-skills are also Laravel-flavoured and independently stale: `module-scaffolder` line 38 cites
-`.claude/rules/02-framework-adapter-laravel.txt`, which does not exist in this repo, and
-`update-action-builder` line 70 describes "raw Eloquent: `lockForUpdate()`, `fill()`,
-`isDirty()`, `save()`". Repairing them is a review of both skills against the WordPress rule
-set, not a rename.
+**Basis.** plan §5 Step 0.3 (CREATE + ACCEPTANCE); plan §4 (the two paths); D-029 (port methods are deferred to the step that uses them); AGENTS §11 ("create only the ports the task needs").
 
-**Proposed AGENTS.md change:** none — the fix belongs in a follow-up brief naming the skills.
+**Impact (files, reversibility).** Two skeletal adapter files whose behaviour is one step later; no method signature is claimed as done. Reversible. **Flagged at the STOP GATE** because the brief's phrase "implementing the Lead contracts" reads more strongly than an empty interface allows.
 
-**Status:** OPEN — needs a follow-up step.
+**Proposed AGENTS.md change:** none (the tension is inside the plan).
+
+## D-036 — `SyncResponseMapper` is bound by its concrete class, not through a contract
+
+**Type:** GAP (rule 03 binds `<Module>MapperContract`; this module declares none) · **Step:** 0.3 · **Status:** DECIDED
+
+**Situation.** Rule 03 §7.10's wiring template ends with `$this->container->bind(CouponMapperContract::class, CouponMapper::class);`. Plan §4's `core/CrmSync/Application/Contracts/` list is `{SyncEventQueryContract, CrmMappingQueryContract, DeadLetterQueryContract, CrmContactGatewayContract, WebhookSignatureVerifierContract, CrmProviderRegistryContract, SyncCommandServiceContract, SyncQueryServiceContract, SyncMapperContract}` — there is **no `SyncResponseMapperContract`**. `SyncMapperContract` is a different thing: the *request* mapper that turns a webhook body into `WebhookEnqueueDTO`.
+
+**Options considered.** (1) Bind `SyncResponseMapper` by its concrete class as a singleton (the `Lead` module's pattern; plan §4 declares no contract for it). (2) Invent a `SyncResponseMapperContract` so the binding matches rule 03's template shape.
+
+**Decision.** Option 1. `SyncResponseMapper` is a stateless, final mapper whose only caller is `SyncCommandService`/`SyncQueryService`, both of which already type-hint the concrete class in their constructors (written in Step 0.2). Binding it by class keeps the provider honest: it binds exactly the types the constructors ask for, and it invents no interface the plan does not name. Same reading as `LeadServiceProvider`.
+
+**Basis.** plan §4 (no `SyncResponseMapperContract`); rule 03 §7.10 (template shape, contradicted); `app/Providers/LeadServiceProvider.php` (the module precedent); AGENTS §11 ("create only the ports the task needs").
+
+**Impact (files, reversibility).** One `singleton()` on a concrete class instead of a contract→class pair; adding a contract later is a two-line change. Reversible.
+
+**Proposed AGENTS.md change:** in rule 03 §7.10, state whether the **response** mapper is bound by contract or by concrete class — the template binds `MapperContract` (the request mapper) and is silent on the response mapper, which is what the two live modules resolved differently from the template.
 
 ---
 
-## D-2026-11-15-07 — the mandated `system:skill-updater` tool does not exist
+## G. Gaps found by the Step 1.1 Value Objects (lead module)
 
-**Step:** `core/03-skill-files-cleanup`.
-**Type:** RULE CONFLICT (brief vs. environment).
+## D-037 — `PhoneNumber` rejects a number with no international prefix, and a repeated `+` is malformed
 
-**Situation:** the plan requires `system:skill-updater` and forbids manual edits, making it the
-first acceptance criterion. Four checks were all negative: no `*skill-updater*` on disk; not in
-`.claude/skills/`; `~/.claude/skills/` does not exist; and the only `skill-updater` string in
-`.claude/` or `~/.claude/` is this session's own transcript, i.e. the plan being read back.
+**Type:** GAP + SELF-CHECK DEFECT · **Step:** 1.1 · **Status:** DECIDED
 
-**Options considered:** halt under H5; or ask the developer to authorise direct edits.
+**Situation.** Plan §5 Step 1.1 says `PhoneNumber` is "E.164 normalization" and nothing more. Two questions it does not settle, which the implementation had to:
+1. A number arriving as `5550100199` (no `+`, no `00`) cannot become E.164 without a country code. Should the VO assume the site's country, or reject it?
+2. The first implementation kept a `+` only when it *led* and stripped every other non-digit, so `++1555` silently collapsed to the valid `+1555`. Found by the Step 1.1 self-check.
 
-**Decision:** raised it with the developer, who chose "manual edit + fix all staleness",
-widening scope from the plan's `BaseRepository`-only replacements to a full staleness review of
-the two named skills.
+**Options considered.** (1) Reject a prefix-less number and a repeated `+`; require the caller to send a country code. (2) Assume a configured default country for a prefix-less number. (3) Accept the collapsed `++1555` form as a lenient convenience.
 
-**Basis:** 09 A9 precedence 1 (the developer's explicit instruction in the current brief,
-within scope) over the brief's tool mandate.
+**Decision.** Option 1. `fromString()` throws `InvalidPhoneNumberException` when the value carries no `+`/`00` prefix, and `normalize()` returns the value untouched when more than one `+` is present, so validation rejects it. Assuming a country would silently invent a wrong number for every foreign contact — a data-integrity fault that surfaces only as a failed sync much later, and the plan's contacts arrive from international sources. Collapsing `++1555` accepts a number the caller never wrote, which contradicts the VO's whole purpose.
 
-**Impact:** both skills edited directly with `Edit`. Acceptance criterion 1 is reinterpreted as
-"edited directly, no skill-updater available".
+**Basis.** plan §3 (`leads.phone` varchar(50) unique) + §5 Step 1.1 (E.164); the `leads` migration's own note ("format phones to E.164"); `01` P6 (validated in the named constructor); AGENTS §7 (the rule lives in the VO); the Step 1.1 self-check finding.
+
+**Impact (files, reversibility).** `PhoneNumber` rejects more inputs than a permissive reader would; widening later is a one-line change in `normalize()`/`isValid()`. Reversible.
+
+**Proposed AGENTS.md change:** none. Worth a plan note: a lead captured from a source that omits a country code is a delivery-level concern (the Request Mapper may prepend one from a configured default), not a Domain one.
+
+## D-038 — Domain Value Objects expose `equals(self): bool` over their canonical value
+
+**Type:** GAP (the convention is unstated in the rules) · **Step:** 1.1 · **Status:** DECIDED
+
+**Situation.** Plan §5 Step 1.1's ACCEPTANCE says the VOs are "compared by value". PHP gives no value equality for objects beyond `==` (loose and property-wise) or `===` (identity), and the module has several value-carrying types (`EmailAddress`, `PhoneNumber` here; `CrmSync\RemoteId`, `ContentHash`, `SanitizedErrorMessage` in Step 1.3). Rule 05 R3 says "compare by value" without naming the mechanism.
+
+**Options considered.** (1) A public `equals(self $other): bool` on each VO, comparing the canonical value with `===`. (2) Rely on `==` at call sites. (3) A shared `ValueObject` interface with `equals()`.
+
+**Decision.** Option 1. `equals(self $other): bool` compares the canonical value with `===` — strict, so it cannot be satisfied by two different types that happen to be loosely equal, and explicit at the call site. A shared interface was rejected as speculative: it would be a Shared port created before a use case needs it, which AGENTS §11 forbids, and `RemoteId` is already being written to the same shape independently (Step 1.3).
+
+**Basis.** plan §5 Step 1.1 (ACCEPTANCE "compared by value"); rule 05 R3 ("compare by value"); AGENTS §7 / §11 (no speculative Shared port); the `CrmSync\RemoteId` docblock from Step 0.2 (strict `===` on the canonical string).
+
+**Impact (files, reversibility).** One method per VO; adopting a shared interface later is additive. Reversible.
+
+**Proposed AGENTS.md change:** in rule 05's VALUE OBJECTS paragraph, state the comparison mechanism — a public `equals(self): bool` using strict `===` on the canonical value — so modules stop each choosing their own.
+
+---
+
+## H. Gaps found by the Step 1.2 LeadEntity behaviour
+
+## D-039 — `LeadEntity` stores canonical strings; the Value Objects stay the validated boundary
+
+**Type:** GAP (the plan passes VOs in but never says what the entity stores) · **Step:** 1.2 · **Status:** DECIDED
+
+**Situation.** Plan §5 Step 1.2 gives `capture(string $uuid, ?EmailAddress $email, ?PhoneNumber $phone, ...)` — Value Objects in. But the constructor written in Step 0.2 (and the `leads` migration behind it, and the Step 2.1 `LeadEntityMapper` that must fill it) declares `?string $email` / `?string $phone`. The step never says whether the entity should now hold the VOs instead.
+
+**Options considered.** (1) `capture()` takes the VOs and stores their canonical strings; the fields stay `?string`. (2) Change the fields to `?EmailAddress` / `?PhoneNumber`, so the entity holds the VOs and the mapper constructs them on read. (3) Have `capture()` take raw strings and build the VOs itself.
+
+**Decision.** Option 1. The VOs are the *input boundary*: they guarantee trim/lowercase/E.164 once, at the door. What survives into the entity is the normalized text the storage column holds, so entity and EntityMapper agree about what a field contains and the 13-parameter constructor is unchanged. Option 2 would move VO construction into the mapper on every read (paying validation repeatedly for values the database already normalized and the UNIQUE index already guarantees), and would put the constructor out of step with the schema for no gain. Option 3 would duplicate normalization into the entity, which `05` R1 puts in the VO.
+
+**Basis.** plan §5 Step 1.2 (VO-typed parameters); plan §3 (`email`/`phone` columns, the migration's normalization note); Step 0.2's `LeadEntity` ctor; `05` R3 (VOs validate and normalize in the named constructor); `01` P6.
+
+**Impact (files, reversibility).** Fields remain `?string` and the ctor unchanged; switching to Option 2 later is a retype plus a mapper change. Reversible. The mapper (Step 2.1) should treat stored values as already-normalized and not re-validate.
+
+**Proposed AGENTS.md change:** none. Worth a plan note in Step 2.1 that the EntityMapper assumes normalized contact values.
+
+---
+
+## I. Gaps found by the Step 1.3 CrmSync Value Objects
+
+## D-040 — `RemoteId` canonicalizes by id *shape*, not by a `CrmProviderName` branch
+
+**Type:** GAP (the step says "provider-aware" without saying what the provider switches on) · **Step:** 1.3 · **Status:** DECIDED
+
+**Situation.** Plan §5 Step 1.3: "`RemoteId`: provider-aware canonicalization (Salesforce 15 to 18 char)". The `CrmProviderName` enum holds one case (`hubspot`) today, and HubSpot ids are numeric — so a `match ($provider)` would have no Salesforce arm to write and nothing to test.
+
+**Options considered.** (1) Expand any 15-character alphanumeric id to 18 characters, regardless of provider, and leave everything else untouched. (2) Add a `salesforce` case to `CrmProviderName` and branch on it. (3) Branch on the provider string when it equals `'salesforce'`.
+
+**Decision.** Option 1. The migration note's requirement is that a case-sensitive 15-character id must not reach the case-insensitive column, and the shape *is* that condition: a 15- or 18-character alphanumeric id is the form the checksum applies to. Keying on shape means (a) a provider added later that uses the same id format is covered with no code change, (b) a mislabelled provider cannot defeat the rule, and (c) nothing is claimed about Salesforce that the enum cannot yet express. `$provider` stays a parameter — it is the documented contract and the place a genuinely provider-specific rule would go — but no branch depends on it today.
+
+**Basis.** plan §5 Step 1.3; the `crm_mappings` migration's note on 15-character ids and case-insensitive collations; `CrmProviderName` (one case only); AGENTS §11 (no speculative surface).
+
+**Impact (files, reversibility).** Any 15-char alphanumeric id from any provider expands; adding a provider-specific rule later is one branch inside `canonicalize()`. Reversible.
+
+**Proposed AGENTS.md change:** none. The plan's wording "provider-aware" overstates what a one-provider enum can express; keying on shape satisfies the intent.
+
+## D-041 — two orderings the Value Objects depend on, neither stated in the rules
+
+**Type:** GAP · **Step:** 1.3 · **Status:** DECIDED
+
+**Situation.** Two behaviours decide whether these VOs are correct and neither is specified anywhere:
+1. `ContentHash` must hash the same state identically regardless of key order, but must **not** treat a reordered *list* as the same state.
+2. `SanitizedErrorMessage` must remove credentials before capping the length, or a truncated message can end mid-token and leave a partial secret that no pattern then matches.
+
+**Options considered.** (1) Sort keys recursively (`ksort`) while preserving list order (`array_is_list()`), and scrub fully before truncating. (2) Sort everything, including lists, for a simpler implementation. (3) Truncate first, on the theory that the cap bounds the work.
+
+**Decision.** Option 1, both. A list's order *is* part of its value — sorting `[1,2]` to `[2,1]` would make two different states hash the same and silently suppress a real change as an "echo". And truncating before scrubbing is a security bug: the cap would cut a token, the patterns would no longer match the fragment, and the fragment would be stored and later read by an administrator.
+
+**Basis.** plan §5 Step 1.3 (key-sorted hashing; S4 scrubbing); the `dead_letters.error_message` column (S4, "an administrator reads it"); AGENTS §11 (no silent failure).
+
+**Impact (files, reversibility).** Both are internal to their VO and covered by tests (list-order sensitivity, secret-past-the-cap). Reversible.
+
+**Proposed AGENTS.md change:** none; these are properties of these two VOs rather than module-wide rules.
+
+---
+
+## J. Gaps found by the Step 1.4 SyncEventEntity transitions
+
+## D-042 — the attempt counter increments on the FAILURE, never on the claim; `with()` needs a KEEP sentinel
+
+**Type:** GAP + SELF-CHECK DEFECT · **Step:** 1.4 · **Status:** DECIDED
+
+**Situation.** Two questions Step 1.4 leaves open, the second found by the self-check:
+1. `attempts` could be incremented when a worker claims the event or when the attempt fails. The step says only that `releaseStaleLock()` does `attempts + 1`.
+2. The first implementation's private `with()` helper copied fields with `$field ?? $this->field`, so passing `null` to clear `locked_at` was indistinguishable from omitting it — and every clearing transition silently failed. Confirmed by execution: `markSucceeded()`, `scheduleRetry()` and `markDead()` all left `locked_at` at the claim instant.
+
+**Options considered.** (1) Increment on failure, and give `with()` a private `KEEP` sentinel default so `null` means "clear". (2) Increment on the claim, and keep `??`. (3) Increment on the claim, and write each transition out longhand.
+
+**Decision.** Option 1, both. Incrementing on the claim would consume the budget for a worker that crashed before calling the CRM, so a crash loop would exhaust the retries without a single real attempt — defeating the counter's purpose. And a stale `locked_at` on a finished event makes the reaper see a live lease on work the ledger has already settled, so it would resurrect succeeded or dead events; the sentinel is what makes "clear" expressible at all.
+
+**Basis.** plan §5 Step 1.4 (`releaseStaleLock` does `attempts + 1`); `05` R1.2 (a behaviour method returns a NEW instance with the rule enforced); `01` P6; the `sync_events` schema (`locked_at` nullable = "no lease"); the Step 1.4 self-check.
+
+**Impact (files, reversibility).** `with()`'s three nullable parameters take a sentinel; internal only. Reversible.
+
+**Proposed AGENTS.md change:** none — but a general note is worth having: a copy-with-overrides helper on an immutable Entity must distinguish "omit" from "set to null", or every nullable field it can clear will silently fail to.
+
+## D-043 — `releaseStaleLock()` refuses an exhausted event; the reaper must dead-letter instead
+
+**Type:** SELF-CHECK DEFECT + RULE GAP · **Step:** 1.4 · **Status:** DECIDED
+
+**Situation.** S1 says the retry ceiling is "kept far below 255 so reaper increments cannot overflow the tinyint". The first implementation bounded only `scheduleRetry()`; `releaseStaleLock()` incremented without limit. A 400-iteration reclaim loop drove `attempts` to exactly 255 — the `unsignedTinyInteger` ceiling — where the write is refused or truncated and the event is stuck in `processing` with a meaningless counter. S1's guarantee therefore held only if the reaper stops at the ceiling, which nothing enforced.
+
+**Options considered.** (1) `releaseStaleLock()` throws `exhausted()` once `attempts` would pass `MAX_ATTEMPTS`; the reaper catches it and dead-letters the event. (2) Cap `attempts` at `MAX_ATTEMPTS` silently and keep releasing. (3) Let the reaper keep incrementing and rely on `MAX_ATTEMPTS` being small.
+
+**Decision.** Option 1. Option 2 releases an event into a queue that will hand it to the same crashing worker forever, which is not recovery; option 3 is what produced the defect. Refusing by name makes the event's only remaining move explicit, and keeps `attempts` clear of the column limit from **every** starting point (verified across `0,1,2,3,4,5,250,254`: max observed 254).
+
+**Consequence for Step 3.5:** the reaper must catch `SyncEventTransitionException` from `releaseStaleLock()` and call `markDead()` on that event, rather than letting the exception propagate and abort the reaper's pass. Recorded there as a required behaviour, not a suggestion.
+
+**Basis.** plan §3 S1 (the ceiling exists so reaper increments cannot overflow); the `sync_events` schema (`attempts` `unsignedTinyInteger`); `01` P6 (no silent failure); the Step 1.4 self-check.
+
+**Impact (files, reversibility).** One guard in `releaseStaleLock()`; one added responsibility in Step 3.5. Reversible.
+
+**Proposed AGENTS.md change:** none. Rule 13 (DB Optimizer) already asks for the column's bounds to be respected; this is that rule applied to the Domain constant that guards the column.
+
+---
+
+## K. Gaps found by the Step 1.6 ports and their supporting types
+
+## D-044 — a `readonly` Value Object cannot promote a property it must normalize
+
+**Type:** SELF-CHECK DEFECT · **Step:** 1.6 · **Status:** DECIDED
+
+**Situation.** `LeadFilter` is `final readonly` and must normalize one of its own inputs (a search term) inside the constructor. The first implementation declared `public ?string $search = null` as a promoted constructor property and reassigned it to the trimmed value in the body. PHP refuses a second write to a readonly property, so construction was a **fatal error on every call that passed a search term** — `Cannot modify readonly property LeadFilter::$search`.
+
+**Options considered.** (1) Declare the property above the constructor, take it as a plain parameter, and assign it once. (2) Drop `readonly` from the class. (3) Normalize in a static named constructor instead, leaving the public constructor pure.
+
+**Decision.** Option 1. Option 2 gives up the immutability that makes the filter safe to pass around and to cache, which is the whole reason the class is readonly. Option 3 hides the constructor and splits one rule across two entry points, when the plan reads the filter as a value object built from request input (Step 3.6 clamps it through `LeadRules` in the Request Mapper, which expects one obvious way to construct it).
+
+**Basis.** plan §5 Step 1.6 (the filtered read takes a `LeadFilter`); `05` R1 (an immutable VO validates itself in its named constructor); the Step 1.6 self-check.
+
+**Impact (files, reversibility).** One class; the promoted property becomes a plain parameter plus one assignment. Reversible.
+
+**Proposed AGENTS.md change:** yes, and it is general — worth a line in rule 05: **a `readonly` class that normalizes its own input must declare that property above the constructor and assign it once; a promoted readonly property cannot be reassigned, and the failure is invisible until a non-null value is passed.** `EmailAddress` and `PhoneNumber` (Step 1.1) already follow this shape, so the rule would be recording existing practice rather than introducing a new one.
+
+## D-045 — a blank search term is absence, not a term that matches everything
+
+**Type:** GAP · **Step:** 1.6 · **Status:** DECIDED
+
+**Situation.** A lead list arrives with a search box, and an empty or whitespace-only submission reaches the filter. The step does not say whether `''` is kept, dropped, or treated as a term. The second round of the self-check caught the first implementation keeping the trimmed-but-empty string, so `hasCriteria()` returned true for a filter that narrowed nothing.
+
+**Options considered.** (1) Trim and collapse a blank result to `null`. (2) Keep `''` and let the adapter skip an empty term. (3) Reject a blank term as invalid input.
+
+**Decision.** Option 1. Option 2 puts the decision in the adapter, which is where a business decision must not live (`AGENTS §11`), and leaves the risk that a `LIKE '%%'` reaches the query and scans every row to filter nothing. Option 3 punishes the ordinary case: pressing Search with an empty box is not an error.
+
+**Basis.** plan §5 Step 1.6 (filtered pages); `AGENTS §11` (adapters hold no business logic); `05` R12 (list input is clamped through a Domain rules class); the Step 1.6 self-check Round 1.
+
+**Impact (files, reversibility).** One statement in `LeadFilter::__construct`. Reversible.
+
+**Proposed AGENTS.md change:** none; this is the standard `''`-to-`null` normalization the guardrail list already requires for `email`/`phone` (plan §6), applied to a search term.
+
+---
+
+## L. Gaps found by the Step 2.2 ledger adapter
+
+## D-046 — a throwing reaper sweep commits its releases but returns no list
+
+**Type:** GAP (contract cannot express the outcome) · **Step:** 2.2 · **Status:** DECIDED
+
+**Situation.** `D-043` requires `releaseStaleLeases()` to refuse an exhausted event by throwing, so the reaper pass can dead-letter it. But the method is a **batch** operation returning `list<SyncEventEntity>`. When one row in the batch is exhausted, the throw discards the returned list even though the other rows in that batch have already been released and committed.
+
+**Options considered.** (1) Drain the batch first, rethrow the first refusal afterwards, and let the caller re-sweep. (2) Rethrow in place as soon as a refusal is met. (3) Absorb the refusal and return the released rows, leaving the exhausted row for some later pass.
+
+**Decision.** Option 1. Option 2 starves the queue: the scan is ordered `locked_at ASC`, so an exhausted row older than the rows behind it aborts the pass at the same position every time and nothing after it is ever reclaimed. Option 3 discards the only signal that the row needs dead-lettering, which is the thing `D-043` exists to preserve. Option 1 keeps both properties — every releasable row is released, and the refusal is still named — at the cost that the caller learns *which* rows were released only by re-sweeping, since the throw carries no list.
+
+**Verified.** Against the real database: with an exhausted row ordered *before* a healthy stale row, the sweep throws, the healthy row ends `pending` with `attempts` incremented and its lease cleared, and the exhausted row is left `processing` at `MAX_ATTEMPTS`. The releases are committed; only the list is lost.
+
+**Consequence for Step 3.5:** after catching the refusal and dead-lettering the named event, the reaper must call `releaseStaleLeases()` **again** to learn the remaining releases, and must tolerate a second throw. Recorded there as required behaviour.
+
+**Basis.** `D-043`; `SyncEventRepositoryContract::releaseStaleLeases()` (the frozen signature returns a list); the `sync_events` schema (`attempts` `unsignedTinyInteger`); the Step 2.2 self-check.
+
+**Impact (files, reversibility).** One `try`/`catch` inside the batch loop and one deferred rethrow; one added responsibility in Step 3.5. Reversible.
+
+**Proposed AGENTS.md change:** none for the rule text. A general note is worth having in rule 05: **a batch port method that signals a per-item refusal by throwing cannot also return the items it succeeded on — decide explicitly which the caller needs, and if it needs both, say so in the contract before the signature is frozen.** This is the second decision in this plan (`D-042` was the first) where a "copy/collect" helper conflated two meanings; here the conflation is between *the batch failed* and *one item in the batch was refused*.
+
+---
+
+## M. Gap found by the Step 2.4 transactional outbox
+
+## D-047 — the outbound idempotency key is derived from the lead's uuid, not from a mutable field
+
+**Type:** GAP (DP-6 specifies a shape but names no external id for a capture) · **Step:** 2.4 · **Status:** DECIDED
+
+**Situation.** DP-6 defines the idempotency key as `sha256(source + ':' + external submission/order/event id)`. For an outbound **capture** there is no external submission id at this layer: the capture arrives from Contact Form 7, WooCommerce or a manual entry, and by the time the outbox adapter runs, all that identifies the work is the lead it created.
+
+**Options considered.** (1) `sha256('lead.captured' + ':' + $lead->uuid)`. (2) Derive from the lead's email or phone. (3) Derive from the lead's row id. (4) Let the caller pass the key in.
+
+**Decision.** Option 1. Option 2 breaks the guarantee the key exists for: the key must be stable across a retry, and a lead enriched with a corrected email between the first attempt and the retry would compute a *different* key and queue a second event for work already owed — two CRM records for one lead. Option 3 is stable but not available at the moment the event is built inside the same transaction that assigns it, and it is a local surrogate rather than something the CRM can be told. Option 4 pushes the rule into every caller, which is exactly where `D-043`/`D-046` show a rule stops being enforced once it is duplicated. The uuid is minted once at capture (`A3`) and never changes, so it is the one field that is both stable and known before the insert completes.
+
+**Verified.** Three consecutive `enqueueForCapturedLead()` calls for one lead produced exactly one `sync_events` row, and the key matched `hash('sha256', 'lead.captured:' . $uuid)`; a different lead produced its own row.
+
+**Consequence for Steps 3.1 and 3.2:** the capture enqueues through this adapter and never computes a key itself; the worker never recomputes one. A second capture of the same lead is a no-op by the unique index rather than by a prior read, so it is race-safe.
+
+**Basis.** plan §2 DP-6 (the shape) and DP-8 (HubSpot only); plan §2 A3 (the uuid is minted at capture and never changes); plan §5 Step 2.4; the `sync_events.idempotency_key` unique column; the Step 2.4 self-check.
+
+**Impact (files, reversibility).** One private method on one adapter, plus the constant naming the event type. Reversible — changing the derivation changes which replays are treated as duplicates, and no stored key becomes invalid because the column only compares equality.
+
+**Proposed AGENTS.md change:** none. Worth noting for the module README: an idempotency key is only idempotent if **every field it is derived from is immutable after creation**; a key built from any field a later step can edit is a duplicate generator, not a duplicate guard.
+
+---
+
+## N. Gap found by the Step 2.5 HubSpot adapter
+
+## D-048 — a fetch that names one property does not return "the record"
+
+**Type:** GAP · **Step:** 2.5 (closed in 3.4) · **Status:** CLOSED — widened in Step 3.4 on the developer's approval (2026-11-23)
+
+**Situation.** `HubSpotAdapter::fetchRecord()` sends `?properties=leadbridge_external_id`, so HubSpot returns that one property plus its own metadata (`id`, `createdAt`, `updatedAt`). The port it implements documents the opposite: `CrmContactGatewayContract::fetchRecord()` returns "the record's properties, as the provider returns them". Step 3.4 is the first caller that needs actual contact fields — an inbound event must be applied to a lead and hashed, and one identifier cannot supply either.
+
+**Options considered.** (1) Leave the filter, and let Step 3.4 name the property set it needs and widen this line. (2) Drop the query parameter and take HubSpot's default property set, which contains the standard contact fields but **not** the custom `leadbridge_external_id` this request deliberately asks for. (3) Write an explicit list now (`email`, `phone`, `firstname`, `lastname`...).
+
+**Decision.** Option 1, deferred. Step 2.5's acceptance names no property set, so (3) would be this step inventing Step 3.4's requirements — and inventing a downstream requirement is precisely what `A9` forbids. Option 2 trades one gap for another (losing the identifier the request was built for) and would quietly break the inbound path's mapping check. The change is one query string, entirely reversible, and it is cheapest to make at the moment the inbound use case states what it reads.
+
+**Basis.** plan §5 Step 2.5 (no property set specified); `09` A9 (GAP tier: do not invent business rules or downstream requirements); `AGENTS §11` (the adapter must serve the port it implements, and the port's own docblock is the contract it currently does not meet).
+
+**Impact (files, reversibility).** One line — the query string in `fetchRecord()`, and the property list if the widening needs a constant. Reversible; no stored data depends on it.
+
+**Proposed AGENTS.md change:** none. A note for Step 3.4 only: **a read port that says "the record" must be asked for the fields its caller uses; a filter written for one purpose (verifying an identifier) silently becomes a truncated read for the next.**
+
+**Consequence for Step 3.4:** before the inbound path is written, state the property set the lead enrichment and the `ContentHash` consume, then widen `fetchRecord()` (or its call) to it. Until then the method is usable only for identifier checks.
+
+**Closure (Step 3.4).** The property set was widened to the six contact fields plus the
+external identifier — `leadbridge_external_id`, `email`, `firstname`, `lastname`, `phone`,
+`company`, `website` — as one private constant beside `EXTERNAL_ID_PROPERTY`. It is exactly the set
+the inbound enrichment DTO consumes and the fields the state hash compares, so the adapter's
+request and the Core's expectations now share one definition.
+
+---
+
+## O. Gaps and defects found by Phase 3 (application services)
+
+## D-049 — the outbound batch's three frames, and why the blueprint is recorded as a decision
+
+**Type:** IMPLEMENTATION NOTE (plan-mandated shape) · **Step:** 3.2 · **Status:** CONFIRMED
+
+**Situation.** Step 3.2 states the claim/HTTP/record split in one sentence. Phase 3 is the first
+place the split exists in code, and the ordering is the whole guarantee: an HTTP call inside a
+transaction would hold a row lock for the provider's response time (up to the adapter's 20 s
+timeout against a 300 s lease), while a claim that committed only after the call would let the
+reaper hand the same event to a second worker.
+
+**Decision.** Claim in one short transaction; unwrap the claim result to a plain array before the
+loop; call the gateway with **no** transaction open; record each outcome in its own transaction
+that re-locks the row and verifies it is still `processing`. Implemented in
+`SyncCommandService::processOutboundBatch()` / `recordOutcome()`.
+
+**Basis.** plan §5 Step 3.2; plan §6 guardrails ("No HTTP call inside a transaction"); AGENTS §10.
+
+**Impact.** One method pair; the call order is the contract. Reversible only by reintroducing the
+lock-duration fault the split exists to prevent.
+
+**Proposed AGENTS.md change:** none for the text; worth a line in rule 05 that a worker's
+"claim → act → record" split is three transactions, and the middle one is not a transaction at all.
+
+## D-050 — the reaper identifies its exhausted row through the READ port
+
+**Type:** GAP (frozen exception carries no id) · **Step:** 3.5 · **Status:** DECIDED
+
+**Situation.** `D-043` requires `releaseStaleLeases()` to throw on an exhausted event, and `D-046`
+requires the releases it already made to commit despite that throw. The exception is
+`SyncEventTransitionException::exhausted()` — frozen, and carrying only `attempts` and `MAX_ATTEMPTS`.
+The reaper therefore knows *that* a row must be dead-lettered but not *which* one. Adding an id to
+the exception would edit a frozen Domain exception (AGENTS §3).
+
+**Options considered.** (1) Add a bounded read to `SyncEventQueryContract` that names the oldest
+exhausted stale row. (2) Widen the frozen exception with an optional event id. (3) Have the reaper
+scan the ledger through a new write-port method.
+
+**Decision.** Option 1. The query selects `status = 'processing' AND attempts >= MAX_ATTEMPTS AND
+locked_at < now - lease`, ordered by `locked_at, id`, `LIMIT 1` — the same boundary the write-side
+sweep uses, so the two agree on which row is at fault. It is bounded, read-only and on the read
+side; option 2 edits frozen code; option 3 puts a pure read on a write port, which §9 forbids.
+
+**Basis.** `D-043`, `D-046`; AGENTS §3 (zero edits in FROZEN files); AGENTS §9; the
+`sync_events_status_next_attempt_idx` and lease columns.
+
+**Impact.** One additive read-port method plus its adapter method. Reversible.
+
+**Proposed AGENTS.md change:** none. General note worth having: **when a batch port signals a
+per-item refusal by throwing, the refusal should name the item; if the contract is frozen without
+it, the identity must be recovered by a bounded read rather than by editing the frozen type.**
+
+## D-051 — inbound enrichment crosses modules through a Lead-owned contract and DTO
+
+**Type:** GAP (no inbound seam existed) · **Step:** 3.4 · **Status:** DECIDED
+
+**Situation.** Step 3.4 requires applying an inbound change "through Lead's application
+contract/port, keeping CrmSync decoupled from Lead internals", but no such port existed: Lead
+exposed `LeadCommandServiceContract::captureLead()` only, and `LeadQueryContract::findById()` by a
+local id the inbound payload does not carry (it carries the remote record id and the record's uuid).
+
+**Options considered.** (1) A Lead-owned `LeadInboundEnrichmentContract` + `LeadCrmEnrichmentDTO`,
+implemented by `LeadCommandService`. (2) CrmSync imports `LeadEntity` and `LeadRepositoryContract`
+directly. (3) CrmSync maps the remote record onto `captureLead()`.
+
+**Decision.** Option 1. Option 2 couples the modules' Domain/Infrastructure and breaks either one's
+portability (AGENTS §1, §3); option 3 would run the create/enrich/merge decision again for a record
+that is already mapped, and would mint a new lead when the mapping is stale rather than surfacing it.
+The DTO carries the lead's uuid, the mapping's expected local id, and the five enrichable fields;
+`LeadCommandService::enrichFromCrm()` re-reads the lead by uuid under `FOR UPDATE`, verifies the id,
+and applies `enrichWith()`.
+
+**Basis.** plan §5 Step 3.4; AGENTS §1 (zone table), §3 (port freeze), §11 (ports in Core,
+implementations outside); AGENTS §8 (inbound contracts).
+
+**Impact.** One port, one DTO, one service method, and an additive `findByUuid()` on
+`LeadQueryContract` (no existing read could resolve a uuid). Reversible.
+
+**Proposed AGENTS.md change:** none; this is §9's CQRS split applied to a cross-module use case.
+
+## D-052 — `CrmProviderRegistryContract` is implemented by `HubSpotProviderRegistry`
+
+**Type:** GAP (port with no implementation) · **Step:** 3.2 · **Status:** DECIDED
+
+**Situation.** `CrmProviderRegistryContract` was declared in `Lead/1.6` and bound nowhere, so
+`SyncCommandService` could not be constructed at all: its constructor takes the port. The first
+release supports one provider (DP-8), so a registry with one arm could also have been skipped by
+injecting `CrmContactGatewayContract` directly.
+
+**Options considered.** (1) A thin `HubSpotProviderRegistry` in `Infrastructure/Adapters` that
+returns the configured gateway and verifier for `hubspot`. (2) Drop the port from the service and
+inject the gateway directly. (3) Delete the port.
+
+**Decision.** Option 1. Option 2 would put provider selection inside a Service as an implicit "there
+is only one" assumption, and the ledger stores a provider name that the worker must honour; option 3
+removes a port the plan names. The registry takes both adapters by injection, so the provider
+provider stays the only place that knows how a gateway is built.
+
+**Basis.** plan §4 (the port is named); plan §2 DP-8; `CrmProviderRegistryContract`'s own docblock
+("adding a provider adds a binding rather than a branch inside Core").
+
+**Impact.** One class, one binding. Adding Salesforce later means one more binding and a lookup
+inside `gatewayFor()`.
 
 **Proposed AGENTS.md change:** none.
 
-**Status:** OPEN.
+## D-053 — the per-event outcome is recorded through a `Result`, and the retry guard asks about the NEXT attempt
 
----
+**Type:** SELF-CHECK DEFECT (two, one masking the other) · **Step:** 3.2 · **Status:** DECIDED
 
-## D-2026-11-15-08 — five further skills carry the same two defects
+**Situation.** Two defects in the first draft of `recordOutcome()`:
+1. The retry path was guarded by `! $locked->isExhausted()`, i.e. "the event has attempts left".
+   `SyncEventEntity::scheduleRetry()` increments `attempts` and then refuses when the *incremented*
+   count passes `MAX_ATTEMPTS` (`D-042`), so an event at `attempts = MAX_ATTEMPTS` passed the guard
+   and threw inside the transaction — the final transient failure ended as a rolled-back recording
+   instead of a dead letter.
+2. The method returned `array{succeeded, retried, dead}`, so a failed recording was reported to
+   `processOutboundBatch()` as `0/0/0` and the batch continued as if the event had vanished.
 
-**Step:** `core/03-skill-files-cleanup`.
-**Type:** RULE ERROR.
+**Options considered.** (1) Guard with `SyncRetryRules::mayRetry($attempts + 1)` and return a
+`Result`. (2) Keep `isExhausted()` and catch `SyncEventTransitionException` inside the closure. (3)
+Count a failed recording as "dead".
 
-**Situation:** the acceptance sweep found `delete-action-builder`, `edit-form-builder`,
-`form-builder`, `index-action` and `store-action-builder` each citing
-`02-framework-adapter-laravel.txt` (does not exist) and `09-autonomous-execution.txt` (wrong
-separator; the real file uses an underscore), and each mandating `Route::resource()` —
-three occurrences per skill — which WordPress does not have.
+**Decision.** Option 1. Option 2 hides the same off-by-one behind an exception and would need a
+second dead-letter attempt for a row it just failed to write; option 3 reports a dead letter that does
+not exist. The guard now asks the question the entity actually answers, and a failed recording is
+returned as a failure that stops the batch — leaving the remaining claimed rows to the reaper.
 
-**Options considered:** fix them now; or record and defer.
+**Basis.** `D-042` (attempt counting), `D-043` (ceiling), plan §5 Step 3.2 ("permanent failure or
+exhausted → markDead + DeadLetterEntity"), AGENTS §10 ("a failure after a write is signalled by
+throwing").
 
-**Decision:** **not edited.** The plan names two skills, and the developer's widening applied to
-those two. Editing five more unprompted is the scope expansion §6 SCOPE and 09 A2.5 forbid.
+**Impact.** One guard, one return type, one call-site unwrap. Reversible.
 
-**Basis:** §6 SCOPE and 09 A2.5.
+**Proposed AGENTS.md change:** none. General note: **a guard that decides whether a transition is
+allowed must ask the same question the entity's guard asks — "will the next attempt be allowed" is
+not the same as "has this attempt been used".**
 
-**Impact:** five skills still instruct agents to use routing and rule files that do not exist in
-this project. Each needs the same treatment this step gave the two named ones — a rewrite
-against the real code, not a search-and-replace.
+## D-054 — echo detection hashes one canonical provider-shaped map in both directions
 
-**Proposed AGENTS.md change:** none — the fix belongs in a follow-up brief naming the skills.
+**Type:** SELF-CHECK DEFECT · **Step:** 3.4 · **Status:** DECIDED
 
-**Status:** OPEN — needs a follow-up step.
+**Situation.** The outbound path hashed the properties it was about to send; the inbound path hashed
+a differently-shaped map (aliases `external_id`/`company_name`/`website_url`) and then stripped the
+aliases. Even after stripping, the two differed on values the provider normalizes: an email returned
+with different casing, or a phone returned without its leading `+`, produced a different digest — so
+`isEcho()` returned false for our own write, the change was applied again, and a fresh outbound event
+followed.
 
----
+**Options considered.** (1) Hash one canonical map in both directions: email case-folded, phone
+reduced to `+` + digits, empty strings to `null`, keys fixed. (2) Hash the vendor's raw body. (3)
+Compare field by field instead of hashing.
 
-## D-2026-11-15-09 — the acceptance command cannot pass, and the HALT template is coupled to section numbers
+**Decision.** Option 1. Option 2 hashes provider metadata (`updatedAt`, `hs_object_id`) that changes
+on every write, so nothing would ever look like an echo; option 3 replaces one stored digest with a
+per-field comparison against a snapshot the schema does not keep.
 
-**Step:** `core/04-agents-and-rules-upgrade`.
-**Type:** RULE CONFLICT (brief says two things that cannot both be true).
+**Basis.** plan §5 Step 3.4 (`isEcho()` suppression); `CrmMappingEntity::isEcho()`; `D-048` (the
+property set); the `crm_mappings.last_synced_hash` column.
 
-**Situation:** the plan's acceptance requires `git check-ignore .claude/rules .claude/skills`
-to "return no matches", and the same instruction requires that local cache/temp files inside
-`.claude/` be ignored. Both cannot hold. A negation rule is the only way to keep `.claude/*`
-ignored while exposing the two subdirectories, and `git check-ignore` **prints the deciding
-pattern even when it is a negation** (`!.claude/rules/`, exit 0). So any correct solution
-produces stdout naming the rules the plan wants silent — the criterion is unsatisfiable as
-written, and a literal reading would push the next agent toward `.claude/rules/`-only patterns
-that anchor wrongly against nested skill paths.
+**Impact.** One private canonicalization used by both paths; the harness asserts the two shapes
+produce the same canonical array. Reversible, and changing it only affects future comparisons.
 
-A second, smaller instance of the same coupling surfaced in the plan's HALT template: it tells
-the agent to "Quote the exact section in `AGENTS.md`". The new Startup Protocol is placed
-*above* §1, but the heading was deliberately **not** renamed to `§0` — `CLAUDE.md` and the rule
-files cite sections by number (`§2`, `§6`), so a renumber would create a second, less visible
-staleness the very rule being added exists to prevent.
+**Proposed AGENTS.md change:** none. Worth a note: **an echo hash is only meaningful if both sides
+are canonicalized by the same function — two "equivalent" normalizations written independently will
+disagree on exactly the inputs the provider rewrites.**
 
-**Options considered:** (a) drop `.claude/*` and expose the whole directory, so `check-ignore`
-is silent — but then local settings and cache become committable, against the plan's own
-sentence; (b) keep `.claude/*` + negations and read the criterion by exit code; (c) ignore
-`.claude/` and un-ignore both subdirectories individually, which hits the "cannot re-include
-inside an excluded directory" rule and leaves rules/skills untracked again — the exact bug.
+## D-055 — the sync query service depends only on the ports it reads
 
-**Decision:** (b). Verified by exit code and behaviour: `git check-ignore -q` returns 1 for all
-three paths, and 18 `.claude/` files plus 11 `docs/` files are addable. The Git Tracking Guard
-was written against that meaning rather than against empty output.
+**Type:** SELF-CHECK DEFECT (unused dependency) · **Step:** 3.6 · **Status:** DECIDED
 
-**Basis:** 09 A9 precedence 3 (specific rule files over a plan's acceptance wording; here the
-plan's own two requirements conflict, so the one that preserves the stated intent — tracked
-rules/skills, ignored local junk — wins) with the RULE CONFLICT recorded.
+**Situation.** `SyncQueryService` was drafted with `CrmMappingQueryContract` in its constructor and
+never used it, while the provider resolved it anyway. The dependency advertised a read the service
+does not perform, and `QueryService` is the layer where "which read ports does this use case need"
+is supposed to be answerable from the signature.
 
-**Impact:** `.gitignore` carries a clarifying comment so the next agent does not "fix" the
-negations back into the untracked state. The report states the deviation. Fully reversible.
+**Options considered.** (1) Remove the parameter and the provider argument. (2) Keep it for a future
+mapping lookup. (3) Add a mapping lookup so the dependency becomes true.
 
-**Proposed AGENTS.md change:** none needed — this is a plan-wording defect. The §0 guard already
-states the check as "MUST return no output **for them**", which is the exit-code meaning.
+**Decision.** Option 1. Option 2 is an unused dependency that will be trusted by the next reader;
+option 3 adds a read no requirement asks for (YAGNI, AGENTS §11).
 
-**Status:** OPEN — worth correcting in the plan template the next time one is written.
+**Basis.** plan §5 Step 3.6 ("read ports only"); rule 05 R12 (Query Service depends only on the read
+contracts it uses); AGENTS §11.
 
----
-
-## D-2026-11-15-10 — 30 stale-skill hits reported, not fixed
-
-**Step:** `core/04-agents-and-rules-upgrade`.
-**Type:** GAP (scope boundary).
-
-**Situation:** the A5b sweep this step added was run against this step's own edits and returned
-30 hits across five skills: `delete-action-builder` (6), `edit-form-builder` (5), `form-builder`
-(5), `index-action` (5), `store-action-builder` (7), plus 2 residual hits in
-`update-action-builder`. They are the same defect `core/03` recorded as D-2026-11-15-08 — rule
-files that do not exist, `Route::resource()` which WordPress has no equivalent of, and `DB::`
-facade references — now itemised with line numbers.
-
-**Options considered:** fix all 30 now, using the new A5b rule as authority; or report them.
-
-**Decision:** **reported, not edited.** A5b authorises fixing hits *inside a step's write scope*;
-this step's scope is `.gitignore`, `AGENTS.md` and rule `09`. The five skills are outside it,
-and `core/03` already established — with the developer's explicit agreement — that they need a
-brief naming them, not an unprompted edit.
-
-**Basis:** §6 SCOPE; 09 A2.5 and A5b's own "outside it: do NOT edit".
-
-**Impact:** five skills still instruct agents to use routing, rule files and a database facade
-this project does not have. Third consecutive step to report the list; the value added here is
-the line numbers. This is exactly the failure mode A5b was written to surface.
-
-**Proposed AGENTS.md change:** none — the fix belongs in a follow-up brief naming the five skills.
-
-**Status:** OPEN — needs a follow-up step.
-
----
-
-## D-2026-11-15-11 — `delete-action-builder` cites a principle section that does not exist
-
-**Step:** `core/04-agents-and-rules-upgrade`.
-**Type:** RULE ERROR (in a skill).
-
-**Situation:** `delete-action-builder/SKILL.md:5` cites `02-framework-adapter-laravel.txt` for
-"the project's rich-domain principle" and the section it names has no counterpart in the real
-`02-framework-adapter-wordpress.txt`. This is a distinct defect from the two `core/03` tabled
-(citation to a nonexistent *file*, and Laravel-only *routing*): it is a citation to a nonexistent
-*section* of an existing file, so a search-and-replace of the filename would leave the reference
-still wrong.
-
-**Options considered:** correct the citation now; or record it with the rest.
-
-**Decision:** recorded, not corrected — `delete-action-builder` is outside this step's scope for
-the same reason as D-2026-11-15-10, and correcting a citation requires reading rule `02` to find
-which section the principle actually lives in, which is skill-rewrite work.
-
-**Basis:** §6 SCOPE; 09 A2.5.
-
-**Impact:** agents running that skill are pointed at a section that does not exist, so the
-principle is effectively unread. One row in the next skill-cleanup brief.
+**Impact.** Two-line removal; the constructor now matches the provider exactly (harness check).
 
 **Proposed AGENTS.md change:** none.
-
-**Status:** OPEN — folds into the follow-up brief with D-2026-11-15-10.
-
----
-
-## D-2026-11-15-12 — the plan's prescribed routing API does not exist in this project
-
-**Step:** `core/05-remaining-skills-cleanup`.
-**Type:** RULE CONFLICT (plan instruction vs. verified codebase).
-
-**Situation:** the plan orders `Route::resource()` replaced with "WordPress REST API routing
-(`register_rest_route()`)". Two checks contradict it. `register_rest_route()` appears **zero times**
-in `app/`, `routes/`, `core/` — it is called inside `framework/Routing/Adapters/RestApiRouterAdapter.php:119`
-and `framework/Routing/Router.php:238/266`, i.e. it is an implementation detail the framework's
-`Route::` facade wraps. And the actions in question (delete, store, update) are **web** routes in
-`routes/web.php` that end in a redirect, not REST endpoints: `Route::post('companies/delete', ...)`
-with `->withOptions(['action' => ...])` and `->middleware(['nonce:' . ...])`. A skill teaching
-`register_rest_route()` would produce code no module in this project contains, and would misplace a
-web form handler onto a REST route.
-
-**Options considered:** (a) follow the plan literally and teach `register_rest_route()`;
-(b) rewrite against the `Route::` facade as `routes/web.php` actually uses it; (c) teach both with a
-note on when REST is right.
-
-**Decision:** (b), after raising it with the developer, who chose "Route:: facade, per real code".
-REST endpoints already exist for reads (`routes/api.php`, `LeadController`), so a future REST-route
-skill has a real reference; this step's five skills are all web/admin screens.
-
-**Basis:** 09 A9 precedence 1 (the developer's explicit instruction in the current brief) applied to
-the plan's own conflict; §11 (adapters isolate framework detail) argues against teaching the raw
-WordPress function in a delivery skill.
-
-**Impact:** all five skills' routing sections rewritten against `routes/web.php` with a named live
-cross-reference. Reversible; no code touched.
-
-**Proposed AGENTS.md change:** none — the correction belongs in the plan template.
-
-**Status:** OPEN — plan wording to fix if a similar brief is written.
-
----
-
-## D-2026-11-15-13 — the plan's prescribed `$wpdb` helpers are not callable from a Service
-
-**Step:** `core/05-remaining-skills-cleanup`.
-**Type:** RULE CONFLICT (plan instruction vs. §9/§11 layering).
-
-**Situation:** the plan orders Eloquent methods replaced with "our custom `$wpdb` helpers
-(`findRecordForUpdate`, `write`, `insert`)". Those three exist — but as `protected` methods on
-`BaseWriteRepository` (`core/Shared/Infrastructure/Repositories/BaseWriteRepository.php:247`, `:144`,
-`:93`), which is **Infrastructure**. A Service that called them would be both a fatal visibility
-error and a §9 boundary violation (a Command Service reaching past its port into the adapter's base
-class). The live vocabulary is two-layered: the Service calls the **port**
-(`CompanyRepositoryContract::delete(int $companyId): void`), and the adapter calls the helper
-(`$this->deleteRecord($companyId, ...)`).
-
-**Options considered:** (a) teach the helpers at every layer, as written; (b) teach the port in
-Services and the helpers in adapters; (c) teach only the port, leaving helper mechanics to rule 03.
-
-**Decision:** (b), after raising it with the developer, who chose "Service calls the port; adapter
-uses the helpers". The skills' repository tasks now show both layers explicitly, which is also what
-makes the CQRS split legible to an agent.
-
-**Basis:** 09 A9 precedence 1 (developer's instruction in the brief, resolving the plan's conflict);
-AGENTS.md §9 (port split) and §11 (ports and adapters).
-
-**Impact:** every Service snippet uses the port; every adapter snippet extends
-`BaseWriteRepository`/`BaseReadRepository` and uses the inherited helper. Also corrected
-`delete(Entity): bool` → `delete(int): void` to match the live contract. Reversible.
-
-**Proposed AGENTS.md change:** none.
-
-**Status:** OPEN — plan wording to fix.
-
----
-
-## D-2026-11-15-14 — the plan's step ID says `core/06`; disk says `core/05`
-
-**Step:** `core/05-remaining-skills-cleanup`.
-**Type:** GAP (numbering).
-
-**Situation:** the plan's headings read `# STEP ID: core/06-remaining-skills-cleanup`, but no
-`core/05` report or PROJECT-LOG row exists — the previous executed step was `core/04`. Taking `06`
-would either skip a number or imply a `core/05` that was never run, breaking the PROJECT-LOG
-sequence a fresh session resumes from (09 A14, "the filesystem is the truth").
-
-**Options considered:** file as `core/06` to match the plan; file as `core/05` to match disk; ask.
-
-**Decision:** filed as **`core/05`**, with the plan's `06` reported as a typo. A9 settles it without a
-halt: the report layout is `<NN>-<step-slug>.md` and A11 requires "EXISTING FILES WIN / keep their
-numbering", so continuing the existing 01→04 sequence is the recorded convention, and `06` would
-leave a hole that reads as a lost step.
-
-**Basis:** 09 A11 (report layout and numbering), A14 (disk is the truth), A9 Tier 2 (a gap the rules
-settle).
-
-**Impact:** the plan file keeps its `06`; the report, PROJECT-LOG row and this decision use `05`. If
-the developer intended a real skipped step, the number is a one-line correction.
-
-**Proposed AGENTS.md change:** none.
-
-**Status:** OPEN — confirm the intended number.
-
----
-
-## D-2026-11-15-15 — the acceptance grep cannot reach zero on a correct rewrite
-
-**Step:** `core/05-remaining-skills-cleanup`.
-**Type:** RULE CONFLICT (acceptance criterion vs. its own intent).
-
-**Situation:** acceptance criterion 1 requires `grep -r "Route::resource" .claude/skills/` to return
-**0 hits**. A skill that must stop an agent using `Route::resource()` has to name it: the checklist
-line reads "No `Route::resource()`, and no direct `register_rest_route()` call". Six such lines exist
-(one per skill, including the out-of-scope `update-action-builder`). Satisfying the criterion
-literally would mean deleting the prohibitions — leaving five skills that no longer *instruct* the
-wrong API but also no longer *warn* against it, which is weaker, not cleaner. Criterion 2
-(`02-framework-adapter-laravel.txt` → 0 hits) is met literally and unambiguously.
-
-**Options considered:** (a) delete the prohibition text to reach zero hits; (b) keep the prohibitions
-and satisfy the criterion by intent; (c) keep one prohibition in a shared location and reference it.
-
-**Decision:** (b). Verified mechanically rather than by eye: a script matched every `Route::resource`
-occurrence against a negation word on the same line — **0 genuine instructions remain**. The criterion
-is reported as met by intent, with the method of verification stated in the report so the claim is
-checkable.
-
-**Basis:** 09 A9 precedence 3 (the specific rule — §6 SCOPE and the anti-hallucination checklist
-convention that a prohibitive item names its subject — over a plan's acceptance wording); 09 A2.3
-(verify, don't assume) governs how the claim is evidenced.
-
-**Impact:** none on the codebase; the report states the reinterpretation explicitly as Deviation 2.
-
-**Proposed AGENTS.md change:** none — but a future acceptance criterion of this kind should read
-"zero hits that *instruct* X", not "zero hits for X".
-
-**Status:** OPEN.
-
----
-
-## D-2026-11-15-16 — the pipeline needs a Scope Gate before Mapping
-
-**Step:** `core/06-log-watcher-skill-enhanced`.
-**Type:** GAP (the plan's pipeline omits a step it depends on).
-
-**Situation:** the plan mandates a 4-step sequence, Log -> Mapping -> Source Inspection -> Confirm
-Violation, and its own guiding principle says a mapping is a lead, not a verdict. Neither the
-sequence nor the matrix contains any check on *whose code* failed. Running the pipeline against the
-live `wp-content/debug.log` shows why that matters: of 6 Fatal blocks and 4 distinct messages, the
-owners are a **deleted temp probe** (`.probe-del2.php`), a **third-party plugin**
-(`wedevs-academy/vendor/autoload.php`), **WordPress core** (`wp-admin/includes/plugin.php`), and a
-**PHP platform check** (`vendor/composer/platform_check.php`). Frame census: 7 WordPress core,
-4 our `tests/manual/probe-*.php`, 2 our `vendor/`, 4 outside, and only 4 in scope
-(`app/` 2, `framework/` 2 — the same single fault). Applying Mapping to the out-of-scope entries
-would attribute a third-party plugin's missing dependency to `02` §5 (our DI bindings).
-
-**Options considered:** (a) the plan's exact 4 steps, mapping every entry; (b) insert a Scope Gate
-between Log Analysis and Mapping, and report non-owned frames as OUT OF SCOPE with their owning
-path; (c) add the ownership note as advisory guidance inside Mapping.
-
-**Decision:** (b), after raising it with the developer, who chose the gate. It is a hard step, not a
-note: an entry whose trace never reaches `app/`, `core/`, `framework/` or `routes/` cannot be a
-breach of this project's rules, and the skill says so plainly.
-
-**Basis:** 09 A9 precedence 1 (the developer's explicit instruction in the current brief) resolving
-a gap the plan does not cover. The plan's own guiding principle supports it — the matrix identifies
-*where to investigate*, which is meaningless for code our rules do not govern.
-
-**Impact:** the skill's pipeline is 5 steps; the report states this as Deviation 1. It also gives
-the log's stale-frame case a home (a frame pointing at deleted code is classified, not mapped).
-
-**Proposed AGENTS.md change:** none beyond the §15 added by this step, which already encodes the
-gate.
-
-**Status:** OPEN — the plan's STEP numbering (4 steps) and the skill (5) now differ by design.
-
----
-
-## D-2026-11-15-17 — the plan's log path is cwd-dependent
-
-**Step:** `core/06-log-watcher-skill-enhanced`.
-**Type:** RULE ERROR (in the plan's command).
-
-**Situation:** the plan gives `grep -n -C 5 "Fatal error" wp-content/debug.log`. That path is
-correct from the WordPress root (`wp-lead-bridge/`) but wrong from this project's working directory,
-the plugin root (`wp-content/plugins/wp-mini-laravel/`), where the real path is `../../debug.log`.
-Verified: `wp-content/debug.log` exists from the WP root; there is **no** `debug.log` inside the
-plugin directory. The failure mode is silent — a wrong path returns empty output, which reads
-exactly like "the log is clean", producing a false negative that looks like a finding of no errors.
-
-**Options considered:** (a) the plan's single path; (b) teach both paths with the cwd each assumes;
-(c) resolve the path into a variable and require the cwd to be stated.
-
-**Decision:** (b), after raising it with the developer, who chose both paths. The skill opens with
-Step 0, a table of cwd -> path, and requires confirming the path resolves to a real file
-(`ls -la`) before any conclusion.
-
-**Basis:** 09 A9 precedence 1 (the developer's instruction in the brief); 09 A2.3 (verify, don't
-assume) and A6 C1 (files planned exist) both argue for the check.
-
-**Impact:** the skill has a Step 0 the plan does not describe; the report states it as Deviation 2.
-The `AGENTS.md` §15 bullet records the same cwd rule.
-
-**Proposed AGENTS.md change:** none.
-
-**Status:** OPEN — plan command to correct if reused.
-
----
-
-## D-2026-11-15-18 — the matrix's `mysqli_sql_exception` row does not match this log
-
-**Step:** `core/06-log-watcher-skill-enhanced`.
-**Type:** AMBIGUOUS BRIEF / RULE ERROR (matrix row vs. observed evidence).
-
-**Situation:** the plan's matrix makes `mysqli_sql_exception` and SQL syntax errors a **High**
-confidence pointer to `02` §7 (Persistence). The live log contains exactly one `mysqli` entry and it
-is a **`PHP Warning`** — `mysqli_real_connect(): (HY000/2002): No connection could be made` — a
-connection failure, not the row's exception class. Separately, `02` §7.6 requires adapters to
-convert `$wpdb` failures into `\RuntimeException` without SQL in the message, which suggests a
-`mysqli_sql_exception` should rarely if ever reach the log in this project at all.
-
-**Options considered:** (a) rewrite the row to target `\RuntimeException` and connection fatals;
-(b) keep the row as the plan wrote it and record the mismatch; (c) keep the row and add both
-exception classes.
-
-**Decision:** (b) — the row is kept verbatim as the plan specifies, and the mismatch is recorded
-here and in the report. Renaming a matrix row the plan fixes by name is a scope expansion on a
-stronger basis than I have; the developer can decide with this evidence in hand. The skill does not
-overclaim: the row's rationale already says "direct `$wpdb`/query mismatch", and Mapping is
-explicitly a lead, not a verdict.
-
-**Basis:** §6 SCOPE (change nothing outside the prompt) and 09 A2.2 (a minor ambiguity is recorded,
-not halted on).
-
-**Impact:** the first matrix row may be aimed at an exception class this project's `02` §7.6 forbids
-from escaping the adapter. A future revision should either add `\RuntimeException` from an adapter,
-or point SQL failures at the connection-level fatal instead.
-
-**Proposed AGENTS.md change:** none — the fix belongs in the skill's matrix, on the developer's
-instruction.
-
-**Status:** OPEN — needs the developer's call on the row's target.
-
----
-
-## D-2026-11-15-19 — "any output" is an over-broad halt condition for the tracking guard
-
-**Step:** `core/07-autonomous-fix-loop`.
-**Type:** RULE CONFLICT (plan instruction vs. the mechanics of the command it names).
-
-**Situation:** the plan requires `git check-ignore -v .claude/rules .claude/skills docs/ai-reports` to
-be run and says: "If this command returns ANY output, HALT immediately." That is not a safe reading
-of the command. `git check-ignore -v` prints the deciding pattern for a path *and still exits 0* for
-an ignored path — but it also prints a line for a **negation** rule (`!.claude/rules/`) when the path
-is in fact **tracked**. This project's `.gitignore` uses exactly that shape, established in `core/04`
-to keep `.claude/rules/` and `.claude/skills/` tracked while ignoring local junk (D-2026-11-15-09).
-So the plan's literal condition would halt on a healthy repository: the tracked case is the one that
-prints.
-
-**Options considered:** (a) apply the literal condition and halt; (b) drop the negations to silence
-the command, which un-tracks the rules and skills again — the original bug; (c) run the plan's
-command verbatim and judge the outcome by exit code, which is what the command actually reports.
-
-**Decision:** (c). The command was run **verbatim** as the plan specifies, returned no output with
-exit 1, and the step proceeded. The plan's halt condition is restated for future steps as: a **path
-is ignored** iff `git check-ignore -q <path>` exits 0; printed lines alone are not a halt.
-
-**Basis:** 09 A9 precedence 3 (a specific rule file over a plan's acceptance wording where the two
-conflict) plus the RULE CONFLICT record required by A9; the same defect was already recorded once as
-D-2026-11-15-09, so this is its second occurrence in a plan.
-
-**Impact:** no file changed for this decision; the gate is documented in the report with the command
-output and its exit code so the reading is checkable. Reversible.
-
-**Proposed AGENTS.md change:** none — §0 already states the guard check correctly. The fix belongs in
-the plan template, which has now produced this defect twice.
-
-**Status:** OPEN — second occurrence; worth correcting the template before the next plan.
-
----
-
-## D-2026-11-15-21 — the local pre-commit hook validates staged blobs
-
-**Step:** `core/09-pre-commit-hooks`.
-**Type:** GAP.
-
-**Situation:** the plan's lint example runs `php -l "$file"` against the working-tree path. A commit hook should validate what is actually staged; a file can differ between the index and the worktree, and filenames can contain spaces or newlines.
-
-**Options considered:** (a) run tools against working-tree paths as shown; (b) read each staged blob from the Git index and pipe it to the checker; (c) block commits whenever index and worktree differ.
-
-**Decision:** (b). Enumerate paths NUL-delimited, then feed `git show :<path>` into PHP lint and the debug scan. Exclude deleted entries and skip binary blobs for text scanning. Keep the hook local at `.git/hooks/pre-commit`, as requested, without changing `core.hooksPath` or adding an installer.
-
-**Basis:** 09 A9 tier 2 (no rule covers staged-vs-working-tree validation); judgment: inspecting the committed snapshot is the smallest correct pre-commit check and preserves support for unusual filenames.
-
-**Impact:** `.git/hooks/pre-commit` and this step's report/log. The hook is checkout-local and is not distributed through Git.
-
-**Proposed AGENTS.md change:** none.
-
-**Status:** OPEN — a repository-managed installation mechanism is a separate scope decision.
-
----
-
-## D-2026-11-15-20 — persona mandates are bounded by project rules and hard stops
-
-**Step:** `core/08-specialized-agent-personas`.
-**Type:** RULE CONFLICT (plan instructions vs. binding architecture and hard-stop rules).
-
-**Situation:** the plan says Domain changes may be handled by "Command Handlers", grants the Security Auditor "absolute veto power" over other concerns, and describes exception wrapping generically. This project defines Command/Query Services (AGENTS.md §8), makes security vetoes subordinate to hard stops (AGENTS.md §6 and rule 09 A10), and names the `$wpdb` duplicate translator specifically (rule 02 §7). Literal persona text could therefore teach a nonexistent service shape, authorize bypassing a hard stop, or conflict with the adapter's real exception boundary.
-
-**Options considered:** (a) copy the brief literally; (b) implement persona guidance constrained by the existing project rules; (c) omit persona-specific conflict and veto guidance.
-
-**Decision:** (b). Domain guidance references Entity behavior and the existing Command/Query Service pattern, not Command Handlers. The Security Auditor may veto only a concrete, evidence-backed vulnerability; its veto blocks unsafe completion but cannot override scope, forbidden-action, or other A10 hard stops. DB guidance uses the established `$wpdb` preparation, transaction, and adapter exception-translation rules. The plan's requested security/correctness/purity/performance ordering and core principle are retained.
-
-**Basis:** AGENTS.md §§6, 8, 10–11; rules 02 §7, 05 R1/R4, and 09 A10; A9 precedence 2 over the plan's unqualified wording.
-
-**Impact:** `.claude/rules/12-persona-domain-specialist.md`, `.claude/rules/13-persona-db-optimizer.md`, `.claude/rules/14-persona-security-auditor.md`, `AGENTS.md`, and this report/log. Reversible documentation changes; plan remains read-only.
-
-**Proposed AGENTS.md change:** none — A17 states the project-bounded handover, conflict, and veto protocol.
-
-**Status:** OPEN — developer review of the A17 wording is welcome.
-
----
-
-## D-2026-11-15-22 — explicit authorization for the Shared read base
-
-**Step:** `Shared/01` (`docs/ai-reports/10-shared-read-repository-helpers.md`).
-**Type:** RULE CONFLICT (prior H6 boundary vs. developer authorization).
-
-**Situation:** The brief requires adding read helpers to the existing `BaseReadRepository`, while 09 A4/H6 ordinarily halts changes to an existing Shared contract/base. The developer selected option 2 in chat: directly authorize editing the existing base and the relevant rule/plan scope.
-
-**Decision:** Apply the authorization narrowly to `core/Shared/Infrastructure/Repositories/BaseReadRepository.php`, with explicitly named supporting rule/plan documentation. No other existing Shared artifact is authorized. `09` A4 now records this exact-artifact + SCOPE FILES exception; the plan records the developer's authorization.
-
-**Basis:** Developer's explicit instruction in this task; 09 A9 precedence 1. All other AGENTS.md §6 scope boundaries remain in effect.
-
-**Impact:** `BaseReadRepository.php`, rule files `02`, `03`, `09`, skills `module-scaffolder` and `delete-action-builder`, and `docs/ai-plans/action_plan.md`; reversible.
-
-**Proposed AGENTS.md change:** none — the narrow exception is recorded in execution rule 09 and this decision.
-
-**Status:** OPEN — authorization is task-specific.
-
----
-
-## D-2026-11-15-23 — the audit found dead code but the brief scopes only reporting
-
-**Step:** `Company/02` (`docs/ai-reports/12-company-module-audit-report.md`).
-**Type:** GAP (report-only scope vs. actionable findings).
-
-**Situation:** The audit found a confirmed defect that a scoped implementation step could fix in one edit: `CompanyController::show()` is routed-nowhere dead code that nonetheless returns a stub `['id' => $id]` array to a view expecting five full fields, and `views/company/show.php` reads that array with `$company['name']` while the service that would supply the data returns a `CompanyDetailResponseDTO` object. Phase 4 of the brief asks for "a final checklist of remaining tasks", i.e. findings, not repairs. Fixing the view or deleting the method unprompted would be the §6 SCOPE expansion the brief does not authorize.
-
-**Options considered:** (a) fix the dead `show()` method and its view in this step; (b) delete `show()` and `show.php` as unreferenced; (c) report them and stop, per the brief's Phase 4.
-
-**Decision:** (c). Every finding is recorded with its file, line, rule and smallest in-scope correction, so a follow-up brief can apply them one at a time. Two findings the audit could not settle as defects are reported as such rather than as violations: the bulk-delete loop is *not* a §10 breach, because each `deleteCompany()` call already runs inside `executeInTransaction()` — only cross-row atomicity is absent, which the brief never asked for.
-
-**Basis:** §6 SCOPE and 09 A2.1 (CURRENT STEP ONLY); the brief's Phase 4 is "Gap Report Generation" and names the output file, not a repair.
-
-**Impact:** no source file changed by this step; the report and the two trail files only. Fully reversible.
-
-**Proposed AGENTS.md change:** none.
-
-**Status:** OPEN — the repairs belong in a follow-up brief naming the controller and the view.
-
----
-
-## D-2026-11-15-24 — the brief's `companies/{id}` cannot address a wp-admin screen
-
-**Step:** `Company/03` (`docs/ai-reports/13-company-details-wiring.md`).
-**Type:** RULE CONFLICT (brief acceptance wording vs. verified framework behaviour).
-
-**Situation:** Acceptance criterion 1 requires `routes/web.php` to register "a GET route for `companies/{id}`". Two verified facts make that unbuildable as written. A bare `Route::get()` in `web.php` is stamped `SURFACE_ADMIN_PAGE` (`framework/Routing/WebRouteRegistrar.php:57-60`), and an admin page is resolved by WordPress matching `?page=` against a slug handed to `admin_menu` — a slug is one string with no segments. The module's own `edit` route already encodes this: it is registered as `company-edit` with the id on the query string, and its docblock at `routes/web.php:69-72` says the hidden option exists precisely because the screen is reached by an id on the query string. Separately, `CompanyController::SCREEN_SLUG` is already `companies`, so reusing that slug for show would have collided with the index screen.
-
-**Options considered:** (a) register `companies/{id}` literally and accept a screen that can never be reached — the F-001 failure this step exists to fix; (b) register `company-show` with the id as a query parameter, matching `edit`/`destroy`; (c) switch the screen to the front-end `page()` surface, where placeholders do work, changing the surface the module uses.
-
-**Decision:** (b). The route is `company-show`, named `companies.show`, `hidden: true`, inside the existing `auth` + `capability:manage_options` group. The brief's intent — wire the details action so it is reachable — is met; its literal path is not, because a literal reading produces a dead route.
-
-**Basis:** 09 A9 precedence 3 (specific rule files over a plan's acceptance wording) with the RULE CONFLICT recorded; 02 §6 and the verified `WebRouteRegistrar` source. An acceptance criterion that cannot be satisfied by correct code is the same defect class already recorded twice as D-2026-11-15-09 and D-2026-11-15-19.
-
-**Impact:** `routes/web.php` only; fully reversible, and the slug is one constant if the developer prefers a different name.
-
-**Proposed AGENTS.md change:** none — the plan template should stop expressing a WordPress admin route as a Laravel-style path with a placeholder.
-
-**Status:** OPEN — confirm the slug `company-show`.
-
----
-
-## D-2026-11-15-25 — `show()` reads the id from the request, not a typed route parameter
-
-**Step:** `Company/03`.
-**Type:** GAP (brief signature vs. the addressing mechanism).
-
-**Situation:** Acceptance criterion 2 requires `CompanyController::show(int $id)`. That signature presumes a framework router injects a path placeholder into the argument, which is how the Laravel build works. In this plugin the id reaches an admin handler as request input: `edit()` and `destroy()` both take `Request $request` and read the id through the private `submittedId()` helper. Passing `int $id` would leave the method with no defined source for its argument once the route carries the id as a query parameter.
-
-**Options considered:** (a) keep `show(int $id)` and let the router bind it; (b) take `Request $request` and reuse `submittedId()`; (c) read `$_GET` directly in the method.
-
-**Decision:** (b). One addressing helper serves three handlers, so the three cannot drift, and the null-id guard is identical to `edit()`'s. Recorded as a GAP rather than a conflict: the brief's signature is not wrong in the abstract, only unavailable in this environment.
-
-**Basis:** 09 A9 precedence 5 (existing codebase convention, verified by reading `CompanyController::edit()` and `submittedId()`); A9 Tier 2.
-
-**Impact:** `CompanyController.php` only; reversible.
-
-**Proposed AGENTS.md change:** none.
-
-**Status:** OPEN.
-
----
-
-## D-2026-11-15-26 — mid-step deletion of ten tracked plan files by an external process
-
-**Step:** `Company/03`.
-**Type:** RULE ERROR (environment).
-
-**Situation:** During the C2 scope audit, `git status --porcelain` showed ten unstaged deletions (` D`) of tracked files under `docs/ai-plans/` — files this session listed present, with sizes and timestamps, at its start. No command run in this session deletes files: the session's commands were read-only inspection (`git check-ignore`, `git ls-files`, `ls`, `find`, `grep`, `php -l`, `git status`, `git diff --check`) plus four `Write` and four `Edit` calls confined to the step's SCOPE FILES, the brief and the reports. The likely cause is an automated sync or cleanup process outside this session.
-
-**Options considered:** (a) restore from Git and continue; (b) halt and leave the tree for the developer to inspect; (c) restore and additionally record a deviation.
-
-**Decision:** Raised as a Structured HALT under AGENTS.md §6 ("destructive action") and 09 A10 H3/H9, because the premise that the working tree was intact had failed and earlier steps' inputs might not be intact. The developer confirmed the cause was external, not a destructive action on the agent's part, and explicitly authorized `git restore docs/ai-plans/*.md`. Ten files were restored; `git status` then showed zero deletions and no code file was affected. The incident is recorded here as (c) as well, so a future session knows the tree was disturbed.
-
-**Basis:** AGENTS.md §6 (HALT for a destructive action) and 09 A10 H3/H9; the recovery was performed only on the developer's explicit authorization, per A9 precedence 1.
-
-**Impact:** no source file changed; ten documentation files restored to their committed state. Fully reversible.
-
-**Proposed AGENTS.md change:** none — the cause is environmental, not a rule defect. If recurrences continue, 09 A8 (ENVIRONMENT) may deserve a clause about external processes mutating the tree mid-step.
-
-**Status:** OPEN — monitor for recurrence.
-
----
-
-## D-2026-11-16-01 — `route()` silently drops parameters for an admin-page surface
-
-**Step:** `Company/04` (`docs/ai-reports/14-company-list-url-refactor.md`).
-**Type:** RULE CONFLICT (brief acceptance wording vs. verified framework behaviour).
-
-**Situation:** Acceptance criterion 2 required edit links to use "`route('companies.edit', ['id' => $company->id])`". Read against the generator's source, that call cannot carry the id. `UrlGenerator::compile()` (`framework/Routing/UrlGenerator.php:159-165`) dispatches on the route's surface, and for `SURFACE_ADMIN_PAGE` it calls `compileAdminPage()` (`:210-215`), which runs `substitute()` and nothing else:
-
-```php
-$slug = $this->substitute($route, $parameters);
-return $this->url('admin_url', 'admin.php?page=' . rawurlencode($slug));
-```
-
-`company-edit` has no path placeholders, so `substitute()` returns the slug unchanged and every key in `$parameters` is discarded. `queryString()` — the method that appends unused parameters — is reached only from `compileFrontEndPage()` (`:274`). The caller therefore receives `admin.php?page=company-edit` with the id gone and **no exception raised**. Corroboration: `grep` for `route('<name>', [` across all of `views/` and `app/` returns zero hits — no surface in this project uses that form.
-
-**Options considered:** (a) implement the criterion literally and ship a broken edit link; (b) move the edit screen to a path-placeholder route so `substitute()` has something to replace — rejected because `company-edit/{id}` is a slug with a segment, which D-2026-11-15-24 established WordPress cannot match; (c) build the address from `route(...)` plus the id in the controller and pass a callable to the view.
-
-**Decision:** Raised as a Structured HALT (A10 H7) before any file was edited. The developer selected Option A/(c) and explicitly amended criterion 2. The address is composed by a new private `CompanyController::recordUrl()`, which chooses the separator from the base and appends `http_build_query(['id' => …])`, and is handed to the view as the `editUrlFor` callable alongside a matching `showUrlFor`.
-
-**Basis:** 09 A9 precedence 1 (the developer's explicit instruction amending the brief) over the criterion's literal wording, with the RULE CONFLICT recorded; the amendment is grounded in verified source rather than preference.
-
-**Impact:** `CompanyController.php` and `views/company/index.php`; the composition logic moved from the template into the controller, so the view composes no URL. Fully reversible.
-
-**Proposed AGENTS.md change:** none for the rules — but a plan template should not express a WordPress admin route as `route('<name>', ['id' => …])`. A one-line warning under 02 §6 would save the next author the discovery. Suggested wording: *"`route('<name>', $params)` carries parameters only for a front-end `page()` or REST route; for an admin-page route the generator drops them silently, so a record id belongs on the query string composed by the caller."*
-
-**Status:** OPEN — confirm the proposed `02` §6 note.
-
----
-
-## D-2026-11-16-02 — `editScreenUrl()` was collapsed into the shared `recordUrl()`
-
-**Step:** `Company/04`.
-**Type:** GAP (duplicate composition with one owner).
-
-**Situation:** Before this step the same "append the record id to a screen address" logic existed twice: as the `$editUrlFor` closure inside `views/company/index.php:96-106` and as `CompanyController::editScreenUrl()` at `:397-403`. The two were free to drift, and only the controller's copy could be reused by a second screen.
-
-**Options considered:** (a) keep `editScreenUrl()` beside the new helper so both exist; (b) replace `editScreenUrl()` with the shared `recordUrl()` and update its single caller in `edit()`; (c) leave the controller's method alone and add a second helper for `show`.
-
-**Decision:** (b). One private helper now serves three call sites — `edit()`, `editUrlFor()` and `showUrlFor()` — so the composition has one owner. The one caller of the removed method was updated in the same step.
-
-**Basis:** 01 P5 (one reason to change per class) and P3 (simplest thing that satisfies the boundaries); no rule names this method, so A9 Tier 2 judgement.
-
-**Impact:** `CompanyController.php` only; no behaviour change — the composition output is identical, verified by executing the helper directly. Reversible.
-
-**Proposed AGENTS.md change:** none.
-
-**Status:** OPEN.
-
----
-
-## D-2026-11-16-03 — the bulk delete loops the single-record port method
-
-**Step:** `Company/05` (`docs/ai-reports/15-company-atomic-bulk-delete.md`).
-**Type:** GAP (where a batch's cardinality belongs).
-
-**Situation:** `deleteMultiple()` has to delete N rows atomically. Two shapes were available: (a) loop `CompanyRepositoryContract::delete(int)` inside the Service's one transaction, or (b) add a bulk method to the write port issuing a single `DELETE ... WHERE id IN (...)`.
-
-**Options considered:** (a) loop the existing single-record method inside one `executeInTransaction()` closure; (b) widen the write port with a `deleteMany(array $ids)` and build the `IN (...)` clause in the adapter; (c) add a separate narrow port for bulk deletes.
-
-**Decision:** (a). 05 R8 states the write port exchanges single records ("Write methods and single-record loads take/return ENTITIES"), and the port is deliberately narrow (ISP). A bulk method added for this one caller would carry a use case's cardinality into the persistence contract, and (c) would add an interface with a single implementation for a single call site. The loop lives in the Service, inside the transaction, which is where the cardinality decision belongs. Atomicity is unaffected: `WpTransactionManager` is a singleton whose depth counter makes the outer `run()` the only frame that issues BEGIN/COMMIT, and the repository's `delete()` opens no frame of its own.
-
-**Basis:** 05 R8 and 01 P5 (ports are small and use-case-shaped); 09 A9 Tier 2 — no rule names the batch shape, and the narrow-port reading is the one the existing contract already follows.
-
-**Impact:** `CompanyCommandService.php` only. The N-round-trip cost is real but bounded by the selection size, and was accepted over widening the write port. Reversible: a bulk port method can be added later without touching the Service's contract.
-
-**Proposed AGENTS.md change:** none — 05 R8 already settles it. If bulk operations become common, a rule naming the accepted pattern (loop in the Service vs. a bulk port method) would remove the judgement call.
-
-**Status:** OPEN — worth a note in 05 if a second module needs a batch.
-
----
-
-## D-2026-11-16-04 — the REST query vocabulary is translated in the controller, not the mapper
-
-**Step:** `Company/06` (`docs/ai-reports/16-company-rest-api.md`).
-**Type:** GAP (where a channel's query vocabulary belongs).
-
-**Situation:** `CompanyMapper::mapToFilterDTO()` reads the page number from `paged`, which is WordPress's key for an admin list table and the right name on a wp-admin screen. A REST client sends `page`. Executed against the real mapper, `mapToFilterDTO(['page' => 3])` returned `page=1`: the parameter was ignored and the endpoint answered 200 with the wrong rows — a wrong answer rather than an error, which is the failure mode nobody reports.
-
-**Options considered:** (a) widen `mapToFilterDTO()` to read `page` as well; (b) translate the key in the API controller before the mapper sees it; (c) accept only `paged` on the API and document it.
-
-**Decision:** (b). `CompanyMapper` is Core Application code shared by every channel, and `paged` is the name the web surface already relies on; teaching it a second channel's spelling would put a delivery concern inside a mapper that three surfaces call. The translation therefore happens in `CompanyController::listCriteria()`, at the boundary that owns the query vocabulary, and `paged` still wins when both are sent. (c) was rejected because it makes a conventional spelling silently wrong for every client.
-
-**Basis:** AGENTS.md §2 (delivery owns its channel's input shape) and 06 T7 (delivery: validate → mapper → one service method); 04 STEP 5 keeps the mapper's contract unchanged. A9 Tier 2 — no rule names the query key.
-
-**Impact:** `app/Http/Controllers/Api/CompanyController.php` only. Reversible; the mapper and its contract are untouched.
-
-**Proposed AGENTS.md change:** none for the rules. A plan or rule template would benefit from one line: *"a delivery layer that reads a query string names its own parameters and translates them for the Mapper; do not widen a Core mapper to accept one channel's spelling."*
-
-**Status:** OPEN.
-
----
-
-## D-2026-11-16-05 — the `PaginatedResult` acceptance item was already satisfied
-
-**Step:** `Company/06`.
-**Type:** AMBIGUOUS BRIEF (an instruction to introduce something that already exists).
-
-**Situation:** Phase 3.1 requires the `index` method to "use a framework-agnostic `PaginatedResult<T>` class" instead of Eloquent's `LengthAwarePaginator`. Both already hold: `Core\Shared\Domain\DataObjects\PaginatedResult` exists and `CompanyQueryService::getPaginatedCompanies()` already returns it inside a `Result`. `grep -rn "LengthAwarePaginator"` across the project returns zero hits — no paginator was ever in use, so there was nothing to replace.
-
-**Options considered:** (a) treat the item as already met and say so; (b) create a second `PaginatedResult` under `app/` to "satisfy" the brief; (c) add a wrapper type around the existing one.
-
-**Decision:** (a). (b) and (c) would each create a duplicate of a Shared kernel type — the AGENTS.md §6 FILE EXISTENCE GUARD failure class — to satisfy an instruction whose intent is already in force. The controller reads `$page->items()` and `$page->meta()`, which is the class the phase asks for.
-
-**Basis:** AGENTS.md §6 (a second file at an occupied path is the worst scope violation) and §3 (Shared Application is FROZEN and ports unchanged). A9 Tier 2.
-
-**Impact:** no file created; the report records the item as met with evidence.
-
-**Proposed AGENTS.md change:** none.
-
-**Status:** OPEN — the brief's wording implies the class was missing; it was not.
-
----
-
-## D-2026-11-16-06 — the API capability is read from the admin controller
-
-**Step:** `Company/06`.
-**Type:** GAP (one policy, two surfaces).
-
-**Situation:** The admin screens gate on `CompanyController::CAPABILITY` (`'manage_options'`). The REST surface needs the same authorization, and the obvious spelling is a second literal in the new middleware.
-
-**Options considered:** (a) restate `'manage_options'` in `RequireCompanyManage`; (b) read the constant from the admin controller; (c) move the constant to a new shared location both surfaces import.
-
-**Decision:** (b). The API endpoint edits the same records the screens edit, so the two must admit the same population; reading the one constant means they cannot drift. (a) permits a future edit to one string and not the other — after which a user who can change a company in wp-admin is refused by the endpoint that changes it, which is a bug nobody looks for. (c) would add a type whose only content is one string, and would leave the admin controller's existing public constant dangling.
-
-**Basis:** 01 P5 (one reason to change) and the "narrowest capability covering the operation" reasoning already recorded in `RequireLeadRead`. A9 Tier 2 — no rule names where a shared capability constant lives.
-
-**Impact:** `app/Http/Middleware/RequireCompanyManage.php` importing `App\Http\Controllers\Admin\CompanyController`. Both are `App\` delivery classes, so the import crosses no zone boundary. Reversible.
-
-**Proposed AGENTS.md change:** none.
-
-**Status:** OPEN.
-
----
-
-## D-2026-11-16-07 — `Company/07` closes as already-satisfied; "(with filters)" is inapplicable
-
-**Step:** `Company/07` (`docs/ai-reports/17-company-update-list-verification.md`).
-**Type:** RULE CONFLICT (a brief whose SCOPE FILES cannot reach its own GOAL).
-
-**Situation:** The step's GOAL is "Implement Update and Paginated List (with filters) endpoints", and its ACCEPTANCE asks `index()` to build a `CompanyFilterDTO` from request parameters. Both endpoints already existed from `Company/06`, so acceptance items 1, 2 and 4 were met on arrival and item 3 was met in substance. The "filters" half was not: `CompanyFilterDTO` and `CompanyFilter` carry only `perPage` and `page`. A sweep of every other module showed `Company` is the only module whose filter has no criteria — `Lead` carries `status`/`source`/`search`, `Contact` `search`, `Deal` `pipelineId`/`dealStageId`, `Activity` six fields. Building one would need `CompanyFilter` and `CompanyFilterDTO` (both FROZEN, AGENTS.md §3) plus `CompanyMapper` and `CompanyQueryContract`/`WpCompanyReadRepository` — four artifacts the brief's SCOPE FILES did not name, and three modes in one step.
-
-**Options considered:** (a) close the step as already-satisfied and treat "(with filters)" as inapplicable; (b) build real filters, expanding scope to the FROZEN Domain/Application artifacts and the write-adjacent read port; (c) implement filtering in the controller by post-filtering a page in delivery.
-
-**Decision:** (a), on the developer's explicit instruction after the conflict was raised as a Structured HALT. (b) was the honest reading of the GOAL but exceeded the authorized scope and would have edited FROZEN files without authorization; (c) was rejected on principle before the developer chose, because post-filtering a returned page yields the wrong rows and a `total` that contradicts them while putting a query concern in delivery. The developer authorized closing the step, directed that no filter code be written and no FROZEN file touched, and confirmed `getPaginatedCompanies()` as the fulfilled pagination requirement.
-
-**Basis:** `09 A10` (halt rather than expand scope) and `09 A4` (changing an EXISTING FROZEN or Shared artifact requires the developer to authorize that exact artifact and the brief to list it in SCOPE FILES); AGENTS.md §3 (FROZEN folders) and §6 (SCOPE). A9 precedence 1 — the developer's explicit instruction resolves the conflict.
-
-**Impact:** no source file created, edited or deleted. `routes/api.php`, `app/Http/Controllers/Api/CompanyController.php` and both `CompanyQueryService*` files are byte-identical to their `Company/06` state. `git status --porcelain` is unchanged from the previous step apart from the two trail files and this report. Fully reversible.
-
-**Proposed AGENTS.md change:** none for the rules — they already forbid this scope expansion. A brief-authoring note would help: *"a step brief whose GOAL names a capability must list in SCOPE FILES every artifact that capability requires; a filter expressed in Domain/Application is not reachable from a delivery-only scope."*
-
-**Status:** OPEN — the developer accepted the module shipping without list filters.
-
----
-
-## D-2026-11-16-08 — the REST `{}` defect is fixed in the framework, not in the Company controller
-
-**Step:** `Company/08` (`docs/ai-reports/18-company-rest-empty-body-diagnosis.md`).
-**Type:** GAP (which layer owns terminating a REST response).
-
-**Situation:** `GET /wp-json/wp-mini-laravel/v1/companies` answers **200** with body `{}` while `leadbridge_companies` holds rows. The cause is not in the module: `CompanyController` returns a `Framework\Http\Responses\JsonResponse`, the REST publication path never calls `send()` on it and never unwraps it (`Router::dispatchTo()` at `framework/Routing/Router.php:398` and `RestApiRouterAdapter::destination()` at `framework/Routing/Adapters/RestApiRouterAdapter.php:247` both hand the object straight back), so WordPress's `rest_ensure_response()` wraps the *object* in `new WP_REST_Response($object)`, `get_data()` returns it, and `wp_json_encode()` emits `{}` because `JsonResponse` has only private properties. The web adapter *does* own sending (`WordPressRouterAdapter.php:646,678,809,868`), so the two domains disagree about who terminates the request. `LeadController` — the pattern `CompanyController` followed — is broken identically and was never caught because its `index()` returns hardcoded sample rows.
-
-**Options considered:** (a) fix in `framework/` with a REST normalizer (adapter-local at dispatch, or centrally on `rest_request_after_callbacks`) so a callback's `ResponseInterface` becomes a `WP_REST_Response` before WordPress serializes it; (b) change the delivery convention so REST controllers return plain arrays / `JsonResource` and never a `JsonResponse`, updating `LeadController`, `CompanyController` and the `make:controller` REST stub; (c) leave it and document it.
-
-**Decision:** **not yet taken — this is a Structured HALT.** (a) requires a `framework/` edit, which AGENTS.md §2 forbids for a module task and §6 makes a hard stop; (b) needs no framework edit but changes the REST contract across every controller and abandons `ResponseInterface` on REST; (c) is unacceptable because it leaves a silent `{}` under a success status. The three options and their trade-offs were reported, and the developer's choice is what this decision is waiting on. No file was edited in this step.
-
-**Basis:** AGENTS.md §2 ("Needed framework feature missing: HALT… A module task NEVER edits `framework/` or `vendor/`"), §6 (HALT for a needed change in `framework/`), and `09 A10` (Structured HALT with 2–3 options rather than an unauthorized fix). A9 precedence 1 — the developer's explicit instruction is required to resolve it.
-
-**Impact:** none to source. This report was the only file created; `git status` is otherwise unchanged by this step. Fully reversible.
-
-**Proposed AGENTS.md change:** none for the rules — they already forbid this fix. Two adjacent notes would help: *"a framework response type is only ever sent by the adapter that owns its domain; a controller returning `ResponseInterface` on the REST domain is a framework defect, not a delivery mistake"*, and the generator side — *"a `make:controller` REST stub must not emit a return type the REST adapter cannot render."*
-
-**Status:** OPEN — awaits the developer's choice between (a), (b) and (c).
-
----
-
-## D-2026-11-16-09 — the REST adapter unwraps a `ResponseInterface`; `data()` joins the contract
-
-**Step:** `Framework/01` (authorized JOB F, resolving `D-2026-11-16-08`).
-**Type:** GAP (which layer unwraps a response type, and whether the body is readable).
-
-**Situation:** `D-2026-11-08`'s `{}`-under-200 defect had to be fixed in `framework/`. The controller returns a `ResponseInterface`; the web adapter *sends* one (`WordPressRouterAdapter`) while the REST adapter returned it straight to WordPress, which wrapped the object in `new WP_REST_Response($object)` and JSON-encoded `get_data()`. The contract declared only `send()` and `status()`, so nothing could read a body generically — the adapter had no way to unwrap even if it tried.
-
-**Options considered:** (a) unwrap in the REST adapter in `destination()`, and add `data(): mixed` to `ResponseInterface` so the body is readable (the developer's choice); (b) unwrap centrally on WordPress's `rest_request_after_callbacks` filter; (c) read the body through `method_exists` and leave the contract at two methods.
-
-**Decision:** (a). The adapter is the boundary that owns its domain's rendering, and a global filter would have to reconstruct the status/header mapping for every REST route in the process, including other plugins'. (c) was rejected because it weakens the guarantee for the exact operation the method exists to perform — the contract would still not promise a readable body, so the next adapter would repeat the guess. Adding `data(): mixed` is a **breaking change** to a documented public interface (F4), taken deliberately and recorded here: `HtmlResponse`, `LayoutResponse` and `RedirectResponse` gained it (returning markup, the child's data, and the redirect target respectively); `JsonResponse` and `ViewResponse` already had it. All five verified.
-
-**Basis:** AGENTS.md §2 (FRAMEWORK mode authorized by the developer for this step) and 10 F1/F4 (adapters translate; a contract change is SemVer-relevant and recorded). The alternative was left documented. Non-`ResponseInterface` returns are passed through untouched, so arrays, `WP_REST_Response` and this class's own `WP_Error` failure paths are unaffected — re-wrapping them would have changed working endpoints.
-
-**Impact:** `framework/Http/Contracts/ResponseInterface.php`, `framework/Http/Responses/{Html,Layout,Redirect}Response.php`, `framework/Routing/Adapters/RestApiRouterAdapter.php` (new private `toRestResponse()` / `responseHeaders()`), and `README.md`. `app/` and `core/` were **not** touched — no controller edit was needed, since returning `JsonResponse` is now correct. Proven by execution: against the real `JsonResponse` class the body goes from `{}` to the full payload. Reversible.
-
-**Proposed AGENTS.md change:** none. §2 and F1 already place this. Worth a line in 10 F2's differences list: *"a REST controller may return a `ResponseInterface`; the REST adapter unwraps it into a `WP_REST_Response` rather than requiring `WP_REST_Response` directly."*
-
-**Status:** OPEN — the `data()` contract addition is a breaking change for any third-party implementer, and is recorded for the changelog.
-
----
-
-## D-2026-11-16-10 — the REST unwrap is ported to `Router`, the router that actually publishes
-
-**Step:** `Framework/02` (`docs/ai-reports/19-rest-response-unwrap-live-path.md`).
-**Type:** GAP (a fix applied to a sibling of the live object).
-
-**Situation:** After `Framework/01`, `GET /wp-json/wp-mini-laravel/v1/companies` still answered **200** with `{}`. `Framework/01` added `toRestResponse()` to `RestApiRouterAdapter`, which is bound (`app/Providers/RouteServiceProvider.php:55`) but never fed routes and never asked to publish: the live REST path is `framework/Routing/RouteServiceProvider.php:107-124`, which resolves **`Router`**, loads `routes/api.php` into it, and calls `registerRoutes()`. `Router::dispatchTo()` hands the controller's raw return value to WordPress (`framework/Routing/Router.php:398`), so `rest_ensure_response()` wrapped the response *object* and `wp_json_encode()` emitted `{}`. `RestApiRouterAdapter::flush()` has zero callers; `'router.api'` is read only by `route:list`. `D-2026-11-16-09`'s "proven by execution" was true of the adapter in isolation — correct code on a path no request travels.
-
-**Options considered:** (1) port the same unwrap into `Router`, the object actually publishing; (2) route REST through `RestApiRouterAdapter` and retire `Router`'s REST role; (3) unwrap centrally on `rest_post_dispatch`.
-
-**Decision:** (1), on the developer's explicit choice. Smallest correct fix, contained in `Router.php`, fixes every REST endpoint at once. (2) is the right long-term shape — it removes the duplicate implementation this defect grew from — but it is a migration across `route:list`, `RouteLoader` and `NamedRoutes`, not a bug fix; recorded as the recommended follow-up step. (3) would re-derive status/header mapping for every REST route in the process, including other plugins'. `toRestResponse()` and `responseHeaders()` on `Router` mirror the adapter's verbatim so the two cannot drift while both exist. `dispatch()` wraps its result **outside** the `withHttpRequest()` closure, leaving the request-scoped binding untouched; `dispatch()` has one caller, the REST callback, so web routing is unreachable from the change.
-
-**Basis:** AGENTS.md §2 (FRAMEWORK mode, authorized by the developer for this step) and §6; 10 F1 (adapters translate). A9 precedence 1 — the developer's explicit instruction resolved the same halt raised in `D-2026-11-16-08`.
-
-**Impact:** `framework/Routing/Router.php` only (imports, `dispatch()`, two new private methods, corrected class docblock). `core/`, `app/`, `routes/` and the adapter were **not** touched. Verified by execution against the real edited class: the list payload goes from `{}` to the full body, with 201/`Location`, 204/null and pass-through of non-`ResponseInterface` values all confirmed. `php -l` clean. Reversible.
-
-**Not verified:** no live WordPress request was run. `LeadController::index()` still returns hardcoded sample rows — a separate defect, out of scope.
-
-**Proposed AGENTS.md change:** none for the rules. A step-authoring note would help: *"when a fix is authorized in `framework/`, the brief must name the object the runtime actually resolves — a defect proven against a class is not fixed until the publishing path is identified, and a sibling implementation of the same behaviour is the trap."*
-
-**Status:** OPEN — the duplicate `toRestResponse()` in two routers is deliberate and temporary; collapsing it (option 2) is recommended as its own step.
-
----
-
-## D-2026-11-16-11 — the unported modules must be ported or removed; the half-ported state is not a third option
-
-**Step:** `Review/01` (`docs/ai-reports/20-full-project-review.md`).
-**Type:** GAP (a port that was started module by module and never finished, over a shared base that has since moved).
-
-**Situation:** Only `Company` is ported, wired and reachable. `Lead` is `$wpdb`-backed but unwired and off the shared bases. `Activity`, `Auth`, `Contact`, `Dashboard`, `Deal`, `Pipeline` still hold Eloquent adapters in `core/*/Infrastructure` (20 files, 16 unresolvable FQCNs), and two of them are fatal at class load: `ActivityWriteRepository::write()` and `DealWriteRepository::write()` are `private` against `BaseWriteRepository::write()`'s `protected`. Six required shared ports have no WordPress adapter and `ClockContract` does not exist. This review is read-only and does not choose between the remedies.
-
-**Options considered:** (a) port the seven modules one at a time on the `Company` template — highest value, seven authorized steps, the port audit can then run on the whole tree; (b) delete the unported modules from the tree until they are ported — removes the fatals and the false impression of a working feature set, loses no working behaviour (none of it can run), and makes the port a fresh start rather than a repair; (c) leave them and only stop the fatals — cheapest, keeps `Core\User` and `App\Models` references alive and guarantees the next base-method change breaks them again.
-
-**Decision:** **not yet taken — this is a Structured HALT.** Every option needs the developer's authorization: (a) and (b) delete or rewrite files that `docs/ai-plans/` and earlier reports already treat as delivered; (c) is a known-inadequate stopgap. The choice also determines whether `Core\User`, which five modules reference and which does not exist, is created or the references are dropped.
-
-**Basis:** AGENTS.md §3 (FROZEN folders port unchanged; a module is ported or it is not), §6 (HALT rather than expand/delete out of scope), §14 (checklist assumes the port audit ran); 06 T8/T9. A9 precedence 1 — the developer's instruction resolves it.
-
-**Impact:** none. This review edited no source, created only its report and this entry, and appended one `PROJECT-LOG.md` row. Reversible.
-
-**Proposed AGENTS.md change:** none for the rules. Two step-authoring notes are recorded in the report §9 (base-change class-load sweep; autoload scan in every porting acceptance).
-
-**Status:** OPEN — awaits the choice between porting (a), pruning (b) and the stopgap (c), and a decision on `Core\User`.

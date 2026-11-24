@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace App\Providers;
 
 use Core\Lead\Application\Contracts\LeadCommandServiceContract;
+use Core\Lead\Application\Contracts\LeadInboundEnrichmentContract;
 use Core\Lead\Application\Contracts\LeadMapperContract;
 use Core\Lead\Application\Contracts\LeadQueryContract;
 use Core\Lead\Application\Contracts\LeadQueryServiceContract;
-use Core\Lead\Application\Contracts\LeadResponseMapperContract;
+use Core\Lead\Application\Contracts\LeadCaptureOutboxContract;
+use Core\Lead\Application\Contracts\LeadMappingRelinkContract;
+use Core\Lead\Application\Mappers\LeadMapper;
 use Core\Lead\Application\Mappers\LeadResponseMapper;
 use Core\Lead\Application\Services\LeadCommandService;
 use Core\Lead\Application\Services\LeadQueryService;
@@ -25,6 +28,10 @@ use DevLinkStudios\WPServiceContainer\ServiceProvider;
  * {@see AppServiceProvider}, which holds shared-kernel bindings only. Each
  * contract has exactly one implementation: the `Wp*` classes under
  * `core/Lead/Infrastructure/Repositories/`, which use `$wpdb`.
+ *
+ * The module's two cross-module ports (`LeadCaptureOutboxContract`,
+ * `LeadMappingRelinkContract`) are implemented in `core/CrmSync/Infrastructure`
+ * and bound by `CrmSyncServiceProvider`, so nothing here names a CrmSync class.
  */
 final class LeadServiceProvider extends ServiceProvider
 {
@@ -88,35 +95,51 @@ final class LeadServiceProvider extends ServiceProvider
      */
     private function registerServices(): void
     {
-        // The DTO-to-entity mapper and the entity-to-response mapper are both
-        // stateless, so a shared instance is safe.
+        // Both mappers are stateless, so a shared instance is safe.
         $this->container->singleton(
-            LeadMapperContract::class,
-            static fn (): LeadMapperContract => new LeadResponseMapper()
+            LeadResponseMapper::class,
+            static fn (): LeadResponseMapper => new LeadResponseMapper()
         );
 
         $this->container->singleton(
-            LeadResponseMapperContract::class,
-            static fn (): LeadResponseMapperContract => new LeadResponseMapper()
+            LeadMapperContract::class,
+            static fn (): LeadMapperContract => new LeadMapper()
+        );
+
+        $this->container->singleton(
+            LeadCommandService::class,
+            fn ($container): LeadCommandService => new LeadCommandService(
+                $container->resolve(LeadRepositoryContract::class),
+                $container->resolve(LeadQueryContract::class),
+                $container->resolve(LeadCaptureOutboxContract::class),
+                $container->resolve(LeadMappingRelinkContract::class),
+                $container->resolve(LeadResponseMapper::class),
+                $container->resolve(\Core\Shared\Domain\Contracts\TransactionManagerContract::class),
+                $container->resolve(\Core\Shared\Domain\Contracts\EventDispatcherContract::class),
+                $container->resolve(\Core\Shared\Domain\Contracts\UuidGeneratorContract::class),
+                $container->resolve(\Core\Shared\Domain\Contracts\ClockContract::class),
+                $container->resolve(\Core\Shared\Domain\Contracts\TranslatorContract::class),
+                $container->resolve(\Psr\Log\LoggerInterface::class)
+            )
         );
 
         $this->container->bind(
             LeadCommandServiceContract::class,
-            fn ($container): LeadCommandServiceContract => new LeadCommandService(
-                $container->resolve(LeadRepositoryContract::class),
-                $container->resolve(LeadResponseMapperContract::class),
-                $container->resolve(\Core\Shared\Domain\Contracts\TransactionManagerContract::class),
-                $container->resolve(\Core\Shared\Domain\Contracts\TranslatorContract::class),
-                $container->resolve(\Psr\Log\LoggerInterface::class),
-                $container->resolve(\Core\Shared\Infrastructure\TransactionManagerContract::class)
-            )
+            fn ($container): LeadCommandServiceContract => $container->resolve(LeadCommandService::class)
+        );
+
+        $this->container->bind(
+            LeadInboundEnrichmentContract::class,
+            fn ($container): LeadInboundEnrichmentContract => $container->resolve(LeadCommandService::class)
         );
 
         $this->container->bind(
             LeadQueryServiceContract::class,
             fn ($container): LeadQueryServiceContract => new LeadQueryService(
                 $container->resolve(LeadQueryContract::class),
-                $container->resolve(LeadResponseMapperContract::class),
+                $container->resolve(LeadMapperContract::class),
+                $container->resolve(LeadResponseMapper::class),
+                $container->resolve(\Core\Shared\Domain\Contracts\TranslatorContract::class),
                 $container->resolve(\Psr\Log\LoggerInterface::class)
             )
         );

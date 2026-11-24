@@ -18,16 +18,21 @@ use Framework\Database\Schema\Schema;
  *  - `uuid` provides a non-sequential public identifier for external CRM
  *    custom properties (`leadbridge_external_id`) and API responses without
  *    exposing auto-increment primary keys.
- *  - `email` and `phone` are declared `->unique()` alone (never chained with
- *    `->index()`, which compiles to a non-unique index) to enforce database-level
- *    uniqueness and enable InnoDB row-level locking (`FOR UPDATE`).
- *  - `website_url` supports B2B lead enrichment alongside `company_name`.
- *  - `meta_json` stores event-specific or source-specific attributes (e.g.,
- *    CF7 `message` / `subject`, WooCommerce shipping notes) without bloating
- *    the core relational columns.
- *  - `assigned_to` is nullable because a lead arriving from a form, order,
- *    or webhook has no owner until claimed, and `nullOnDelete` frees leads
- *    rather than deleting them when a user is removed.
+ *  - `name` is nullable because partial-contact sources (e.g., WhatsApp
+ *    phone-only or Facebook email-only webhooks) may arrive before a full
+ *    name is enriched.
+ *  - `email` (191) and `phone` (50) are declared `->unique()` separately
+ *    (never chained with `->index()` and never combined into a composite
+ *    unique key). Application ingestion MUST normalize empty strings `''` to
+ *    `null`, lowercase+trim emails, format phones to E.164, and resolve
+ *    cross-record collisions (e.g., email matches Lead A while phone matches
+ *    Lead B) via deterministic domain merge before persistence.
+ *  - `['status', 'source']` uses a composite index to accelerate both
+ *    status-only queries and combined dashboard filters without index merges.
+ *  - `meta_json` stores source-specific attributes as `longText` for broad
+ *    MariaDB/MySQL compatibility; application layer validates JSON structure.
+ *  - All `dateTime` columns store UTC timestamps managed explicitly by the
+ *    application repository layer.
  */
 final class CreateLeadsTable extends Migration
 {
@@ -36,23 +41,24 @@ final class CreateLeadsTable extends Migration
         Schema::create('leads', function (Blueprint $table) {
             $table->id();
             $table->string('uuid', 36)->unique();
-            $table->string('name');
-            $table->string('email')->nullable()->unique();
-            $table->string('phone')->nullable()->unique();
+            $table->string('name')->nullable();
+            $table->string('email', 191)->nullable()->unique();
+            $table->string('phone', 50)->nullable()->unique();
             $table->string('company_name')->nullable();
             $table->string('website_url')->nullable();
-            $table->string('status')->default('new')->index();
-            $table->string('source')->index();
+            $table->string('status', 50)->default('new');
+            $table->string('source', 50);
             $table->longText('meta_json')->nullable();
 
-            // No ->after() here: that modifier only compiles inside ALTER
-            // TABLE, and this column is declared at create time.
             $table->foreignId('assigned_to')
                 ->nullable()
                 ->constrained('users')
                 ->nullOnDelete();
 
-            $table->timestamps();
+            $table->dateTime('created_at')->nullable();
+            $table->dateTime('updated_at')->nullable();
+
+            $table->index(['status', 'source'], 'leads_status_source_idx');
         });
     }
 

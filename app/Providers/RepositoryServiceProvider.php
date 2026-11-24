@@ -7,9 +7,6 @@ namespace App\Providers;
 use App\Cache\WpCacheStore;
 use App\Database\AtomicDatabaseRateLimiter;
 use App\Database\WpTransactionManager;
-use Core\Lead\Application\Contracts\LeadQueryContract;
-use Core\Lead\Domain\Contracts\LeadRepositoryContract;
-use Core\Lead\Infrastructure\Mappers\LeadEntityMapper;
 use Core\Shared\Domain\Contracts\CacheInterface;
 use Core\Shared\Domain\Contracts\RateLimiterContract;
 use Core\Shared\Domain\Contracts\TransactionManagerContract;
@@ -18,11 +15,10 @@ use Core\Shared\Infrastructure\Localization\WpTranslator;
 use Core\Shared\Infrastructure\Logging\WpLogger;
 use DevLinkStudios\WPServiceContainer\ServiceProvider;
 use Framework\Config\Config;
-use Framework\Database\Query\QueryBuilderInterface;
 use Psr\Log\LoggerInterface;
 
 /**
- * Container bindings for the lead module's adapters and shared infrastructure.
+ * Container bindings for the shared kernel's adapters.
  */
 final class RepositoryServiceProvider extends ServiceProvider
 {
@@ -44,9 +40,9 @@ final class RepositoryServiceProvider extends ServiceProvider
             static fn (): AtomicDatabaseRateLimiter => new AtomicDatabaseRateLimiter()
         );
 
-        $this->registerLeadRepository();
         $this->registerTranslator();
         $this->registerLogger();
+        $this->registerCache();
     }
 
     /**
@@ -83,54 +79,9 @@ final class RepositoryServiceProvider extends ServiceProvider
     }
 
     /**
-     * Bind the lead repositories and cache store.
+     * Bind the shared cache store.
      */
-    private function registerLeadRepository(): void
-    {
-        // Write repository, bound by concrete class. Takes the mapper and an
-        // optional $wpdb; the container builds it and the handle is resolved
-        // lazily inside.
-        $this->container->bind(
-            \Core\Lead\Infrastructure\Repositories\LeadWriteRepository::class,
-            static fn (): \Core\Lead\Infrastructure\Repositories\LeadWriteRepository
-                => new \Core\Lead\Infrastructure\Repositories\LeadWriteRepository(new LeadEntityMapper())
-        );
-
-        // Read repository, bound by concrete class. Takes the fluent builder and
-        // the mapper; the builder resolves the connection lazily inside, so
-        // constructing this during register() is safe.
-        $this->container->bind(
-            \Core\Lead\Infrastructure\Repositories\LeadReadRepository::class,
-            fn ($container): \Core\Lead\Infrastructure\Repositories\LeadReadRepository
-                => new \Core\Lead\Infrastructure\Repositories\LeadReadRepository(
-                    $container->resolve(QueryBuilderInterface::class),
-                    new LeadEntityMapper()
-                )
-        );
-
-        // Bound by interface as well, because the services type-hint the
-        // contracts rather than the concrete classes.
-        $this->container->bind(
-            LeadRepositoryContract::class,
-            fn ($container): LeadRepositoryContract => $container->resolve(
-                \Core\Lead\Infrastructure\Repositories\LeadWriteRepository::class
-            )
-        );
-
-        $this->container->bind(
-            LeadQueryContract::class,
-            fn ($container): LeadQueryContract => $container->resolve(
-                \Core\Lead\Infrastructure\Repositories\LeadReadRepository::class
-            )
-        );
-
-        $this->registerLeadCache();
-    }
-
-    /**
-     * Bind the lead module's cache store.
-     */
-    private function registerLeadCache(): void
+    private function registerCache(): void
     {
         // Reads app.prefix via config() because the framework requires
         // configuration to be read through Config and passed in. Falls back

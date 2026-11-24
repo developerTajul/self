@@ -46,7 +46,7 @@ interface CompanyResponseMapperContract
     public function toEditResponseDTO(CompanyEntity $company): CompanyEditResponseDTO;
 
     /**
-     * Builds the 360-degree profile DTO from the detail read model.
+     * Builds the profile DTO from the detail read model.
      *
      * @param CompanyDetailData $companyDetail
      *

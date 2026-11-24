@@ -47,9 +47,9 @@ return [
     'providers' => [
         \App\Providers\AppServiceProvider::class,
 
-        // Binds the lead write and read ports to their $wpdb-backed adapters.
-        // Listed before the routing providers so a service resolved during boot
-        // finds the binding in place.
+        // Binds the shared-kernel adapters (transaction manager, rate limiter,
+        // translator, logger, cache store). Listed before the routing providers
+        // so a service resolved during boot finds the binding in place.
         \App\Providers\RepositoryServiceProvider::class,
 
         // Binds the company module's repositories, mappers and services. It
@@ -57,10 +57,16 @@ return [
         // and logging), so it is listed after them.
         \App\Providers\CompanyServiceProvider::class,
 
-        // Binds the lead module's repositories, mappers and services. It
-        // depends on the shared-kernel bindings above (transactions, translation
-        // and logging), so it is listed after the company provider.
+        // Binds the lead module's repositories, mappers and services. It depends
+        // on the shared-kernel bindings above (transactions, dispatch, clock,
+        // uuid, translation and logging), so it is listed after them.
         \App\Providers\LeadServiceProvider::class,
+
+        // Binds the CRM sync module's repositories, mappers and services, plus
+        // the lead module's two cross-module ports, whose adapters live in
+        // `core/CrmSync/Infrastructure/Adapters/`. Listed after the lead and
+        // shared-kernel providers it depends on.
+        \App\Providers\CrmSyncServiceProvider::class,
 
         \App\Providers\RouteServiceProvider::class,
         \Framework\Database\MigrationServiceProvider::class,

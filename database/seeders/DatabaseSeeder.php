@@ -61,10 +61,9 @@ final class DatabaseSeeder extends Seeder
      * @var list<string>
      */
     private const SEEDERS = [
-        // Nothing above it yet. A seeder for users goes first when assignment by
-        // id stops being a fixture detail and starts mattering — the leads below
-        // reference user 1, which the fixtures treat as an existing account.
-        'lead',
+        // Empty until the project adds its first seeder. A seeder for users goes
+        // first when assignment by id stops being a fixture detail and starts
+        // mattering.
     ];
 
     public function __construct(private readonly SeederRegistry $registry)

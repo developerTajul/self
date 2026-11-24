@@ -7,11 +7,11 @@
 # separately and never lives inside vendor.
 /vendor
 node_modules/
-/tests
-/tools
 
 # composer.lock IS committed on purpose: reproducible dependency
 # resolution across machines and deploys.
+
+# tests/ is NOT ignored — the suite runs on CI and collaborators need it.
 
 # ---------------------------------------------------------------
 # Build & tooling artifacts
